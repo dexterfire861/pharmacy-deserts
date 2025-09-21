@@ -155,6 +155,53 @@ def read_health_data(file_path):
     df['ZCTA5'] = df['ZCTA5'].astype(str).str.split('.').str[0].str.zfill(5)
     return df
 
+# --- read AI scores produced by your notebook ---
+def read_ai_scores_csv(path='data/ai_scores.csv'):
+    try:
+        df = pd.read_csv(path, dtype={'zip': str})
+    except FileNotFoundError:
+        # no AI file yet; return empty frame so app still runs
+        return pd.DataFrame(columns=['zip','ai_score'])
+    df['zip'] = df['zip'].astype(str).str.extract(r'(\d{5})')[0].str.zfill(5)
+    df = df.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
+    # If duplicates per ZIP exist, average them
+    return df.groupby('zip', as_index=False)['ai_score'].mean()
+
+
+# --- export the mathematical score in case you want a CSV of it too ---
+def export_math_scores_csv(ranked_df, path='data/math_scores.csv'):
+    out = ranked_df[['zip','score']].rename(columns={'score':'score_math'}).copy()
+    out.to_csv(path, index=False)
+    return out
+
+
+# --- average AI + math into final_score (with optional normalization) ---
+def average_scores(math_df, ai_df, normalize=True):
+    # math_df: columns zip, score_math
+    # ai_df:   columns zip, ai_score
+    merged = pd.merge(math_df, ai_df, on='zip', how='outer')
+
+    def _norm01(s):
+        s = pd.to_numeric(s, errors='coerce')
+        if s.dropna().empty:
+            return s.fillna(0)
+        rng = s.max() - s.min()
+        return (s - s.min())/rng if rng else s*0
+
+    if normalize:
+        merged['math_n'] = _norm01(merged['score_math'])
+        merged['ai_n']   = _norm01(merged['ai_score'])
+        # row-wise mean ignoring NaNs; if one is missing, the other carries through
+        merged['final_score'] = merged[['math_n','ai_n']].mean(axis=1, skipna=True)
+    else:
+        merged['final_score'] = merged[['score_math','ai_score']].mean(axis=1, skipna=True)
+
+    # if BOTH missing, set to NaN → fill with 0 so sorting works
+    merged['final_score'] = merged['final_score'].fillna(0)
+
+    return merged[['zip','final_score','score_math','ai_score']]
+
+
 
 
 import numpy as np
@@ -290,6 +337,35 @@ def read_population_labels(file_path):
     if st_col:   out["state"] = df[st_col].astype(str).str.strip()
     return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
 
+def read_ifae_csv(path="results/national_ifae_rank.csv"):
+    """
+    Reads the AI CSV with columns:
+    ZCTA5, IFAE_score, composite, iforest_anomaly, median_income, poor_health_pct,
+    population, pharmacies_count, pop_per_pharmacy, income_pct_inv, health_pct,
+    access_pct_inv, density_pct, pop_density, heat_hhb, heat_pct
+
+    Returns: DataFrame with ['zip','ai_score'] (ai_score from IFAE_score).
+    """
+    try:
+        df = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str})
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["zip", "ai_score"])
+
+    # 5-digit ZIP
+    df["zip"] = (
+        df["ZCTA5"].astype(str)
+        .str.extract(r"(\d{5})")[0]
+        .str.zfill(5)
+    )
+
+    # Use IFAE_score as the AI score (you can switch to 'composite' if you prefer)
+    df["ai_score"] = pd.to_numeric(df["IFAE_score"], errors="coerce")
+
+    # One row per zip
+    out = df[["zip", "ai_score"]].dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+    return out
+
+
 
 def render_top10_map(top10: pd.DataFrame):
     """Show top 10 ZIPs with permanent labels; falls back if Folium isn't installed."""
@@ -330,45 +406,27 @@ def render_top10_map(top10: pd.DataFrame):
 
             # main dot sized by score
             popup = folium.Popup(
-                folium.IFrame(
-                    html=f"""
-                        <b>ZIP:</b> {r['zip']}<br>
-                        <b>Place:</b> {place}<br>
-                        <b>Score:</b> {r['score']:.3f}<br>
-                        <b>Pharmacies:</b> {int(r['n_pharmacies'])}<br>
-                        <b>Pop density:</b> {r['pop_density']:.1f}
-                    """,
-                    width=220, height=140
-                ),
-                max_width=240
-            )
+                        folium.IFrame(
+                            html=f"""
+                                <b>ZIP:</b> {r['zip']}<br>
+                                <b>Place:</b> {place}<br>
+                                <b>Final score:</b> {r.get('final_score', float('nan')):.3f}<br>
+                                <b>Math score:</b> {r.get('score_math', float('nan')):.3f}<br>
+                                <b>AI score:</b> {r.get('ai_score', float('nan')):.3f}<br>
+                                <b>Pharmacies:</b> {int(r['n_pharmacies'])}<br>
+                                <b>Pop density:</b> {r['pop_density']:.1f}
+                            """,
+                            width=240, height=170
+                        ),
+                        max_width=260
+                    )
             folium.CircleMarker(
-                location=[lat, lon],
-                radius=max(5, min(20, 5 + 15*float(r["score"]))),
-                color=None, fill=True, fill_opacity=0.7,
-                popup=popup,
-            ).add_to(fmap)
+                        location=[lat, lon],
+                        radius=max(5, min(20, 5 + 15*float(r.get("final_score", 0)))),
+                        color=None, fill=True, fill_opacity=0.7,
+                        popup=popup,
+                    ).add_to(fmap)
 
-            # ALWAYS-VISIBLE label next to the dot (no hover needed)
-            folium.Marker(
-                location=[lat, lon],
-                icon=folium.DivIcon(
-                    html=f"""
-                        <div style="
-                            font-size:12px;
-                            font-weight:600;
-                            color:#111;
-                            background:rgba(255,255,255,0.85);
-                            padding:2px 6px;
-                            border-radius:4px;
-                            border:1px solid rgba(0,0,0,0.2);
-                            white-space:nowrap;
-                        ">
-                            {r['zip']} — {place}
-                        </div>
-                    """
-                )
-            ).add_to(fmap)
 
 
         st_folium(fmap, width=None)
@@ -393,6 +451,9 @@ def main():
     df = preprocess(financial_data, health_data, pharmacy_data, population_data,
                 aqi_annual=aqi_annual, hhi=hhi)
 
+
+
+
     # Sliders
     st.sidebar.header("Adjust Weights")
     w_scarcity = st.sidebar.slider("Scarcity (fewer pharmacies)", 0.0, 1.0, 0.30, 0.05)
@@ -406,14 +467,34 @@ def main():
     total = w_scarcity + w_health + w_income + w_pop + w_aqi + w_heat
     w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat = [w/total for w in [w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat]]
 
+    # --- your math ranking (already computed above) ---
     ranked = score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=w_aqi, w_heat=w_heat)
+
+    # Build a minimal math-scores df for merging
+    math_df = ranked[['zip', 'score']].rename(columns={'score': 'score_math'}).copy()
+
+    # Read AI CSV (IFAE)
+    ai_df = read_ifae_csv("results/national_ifae_rank.csv")
+
+    # Average (normalized) math + AI -> final_score
+    combo = average_scores(math_df, ai_df, normalize=True)
+
+    # Attach final_score, ai_score back to the full ranked frame
+    ranked = ranked.merge(combo, on='zip', how='left')
+
+    # Use final_score for ordering and for the map
+    ranked = ranked.sort_values(['desert_flag','final_score'], ascending=[False, False])
 
     # Show a few extra HHI columns if present
     show_cols = ['zip','n_pharmacies','pop_density','median_income','health_burden']
-    if 'aqi' in ranked.columns:       show_cols.append('aqi')
-    if 'heat_hhb' in ranked.columns:  show_cols.append('heat_hhb')
-    show_cols += ['scarcity','pop_norm','income_inv','health_n','score','desert_flag']
+    if 'aqi' in ranked.columns:       
+        show_cols.append('aqi')
+    if 'heat_hhb' in ranked.columns:  
+        show_cols.append('heat_hhb')
+    # add the math/AI/final columns
+    show_cols += ['scarcity','pop_norm','income_inv','health_n','score_math','ai_score','final_score','desert_flag']
     st.dataframe(ranked[show_cols].head(50))
+
 
     st.write("### Top 10 ZIPs on the map")
     top10 = ranked.head(10).copy()
