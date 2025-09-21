@@ -433,7 +433,8 @@ def render_top10_map(top10: pd.DataFrame):
     except ModuleNotFoundError:
         st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
         st.map(top10.dropna(subset=["lat","lon"])[["lat","lon"]], zoom=4, use_container_width=True)
-        st.dataframe(top10[["zip","place","score","n_pharmacies","pop_density"]])
+        keep = [c for c in ["zip","place","final_score","score_math","ai_score","n_pharmacies","pop_density"] if c in top10.columns]
+        st.dataframe(top10[keep])
 
 
 
@@ -470,6 +471,10 @@ def main():
     # --- your math ranking (already computed above) ---
     ranked = score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=w_aqi, w_heat=w_heat)
 
+    # Ensure math score is numeric and drop rows with None/NaN math score
+    ranked['score'] = pd.to_numeric(ranked['score'], errors='coerce')
+    ranked = ranked.dropna(subset=['score'])
+
     # Build a minimal math-scores df for merging
     math_df = ranked[['zip', 'score']].rename(columns={'score': 'score_math'}).copy()
 
@@ -482,8 +487,27 @@ def main():
     # Attach final_score, ai_score back to the full ranked frame
     ranked = ranked.merge(combo, on='zip', how='left')
 
-    # Use final_score for ordering and for the map
-    ranked = ranked.sort_values(['desert_flag','final_score'], ascending=[False, False])
+        # ---- pick ONE column to rank by everywhere ----
+    sort_col = 'final_score' if 'final_score' in ranked.columns else 'score'
+
+    # force numeric and drop missing
+    ranked[sort_col] = pd.to_numeric(ranked[sort_col], errors='coerce')
+    ranked = ranked.dropna(subset=[sort_col])
+
+    # optional: make desert_flag numeric for deterministic sort
+    ranked['desert_flag'] = ranked['desert_flag'].astype(int)  # True=1, False=0
+
+    # deserts first, then highest score; stable sort and reset index
+    ranked = (
+        ranked.sort_values(['desert_flag', sort_col],
+                        ascending=[False, False],
+                        kind='mergesort',
+                        na_position='last')
+            .reset_index(drop=True)
+    )
+
+
+
 
     # Show a few extra HHI columns if present
     show_cols = ['zip','n_pharmacies','pop_density','median_income','health_burden']
