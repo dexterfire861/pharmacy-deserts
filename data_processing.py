@@ -1,89 +1,96 @@
+"""
+Pharmacy Desert Analysis - Data Processing Module
+==================================================
+This module contains all data loading and processing functions for pharmacy desert analysis.
+For the Streamlit UI, see app.py
+
+Functions:
+- read_*_data: Load data from various sources (financial, health, pharmacy, population, AQI, HHI)
+- preprocess: Merge and clean all data sources
+- score_candidates: Apply mathematical scoring model
+- average_scores: Blend mathematical and AI scores
+- render_top10_map: Display interactive map (requires Streamlit)
+"""
+
 import pandas as pd 
+import numpy as np
+import streamlit as st
 
 
+@st.cache_data
 def read_financial_data(file_path):
+    """Read financial/income data from Census CSV"""
     df = pd.read_csv(file_path)
-    #print(df.columns)
     df = df[['NAME', 'S1901_C01_012E']]
+    df['zip'] = df['NAME'].str.extract(r'(\d{5})')
     df['zip'] = df['NAME'].str.extract(r'(\d{5})')
     return df
 
-import pandas as pd
-import numpy as np
 
+@st.cache_data
 def read_hhi_excel(file_path):
     """
-    Reads Heat-Health Index (HHI) Excel and returns:
-      zip, heat_hhb (from HHB_SCORE), nbe_score (optional), hhi_overall (optional)
+    Read Heat-Health Index (HHI) Excel data
+    
+    Returns: DataFrame with zip, heat_hhb (from HHB_SCORE), nbe_score, hhi_overall
     """
-    # Load – if there are multiple sheets, you can pass sheet_name=...
     df = pd.read_excel(file_path, dtype={'ZCTA': str})
 
-    # Ensure 5-digit ZIP from ZCTA
     if 'ZCTA' not in df.columns:
         raise ValueError("HHI Excel must contain 'ZCTA' column.")
+    
     df['zip'] = (
         df['ZCTA'].astype(str)
-        .str.extract(r'(\d{5})')[0]     # <-- get the first group
+        .str.extract(r'(\d{5})')[0]
         .fillna('')
         .str.zfill(5)
     )
 
-    # Pick columns if present
     out = pd.DataFrame({'zip': df['zip']})
 
     if 'HHB_SCORE' in df.columns:
         out['heat_hhb'] = pd.to_numeric(df['HHB_SCORE'], errors='coerce')
-
-    # Optional extras if you want them later
     if 'NBE_SCORE' in df.columns:
         out['nbe_score'] = pd.to_numeric(df['NBE_SCORE'], errors='coerce')
     if 'OVERALL_SCORE' in df.columns:
         out['hhi_overall'] = pd.to_numeric(df['OVERALL_SCORE'], errors='coerce')
 
-    # Keep one row per ZIP
-    out = out.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
-
-    return out
+    return out.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
 
 
+@st.cache_data
 def read_aqi_data(file_path):
     """
-    Reads hourly/daily PM2.5 rows and aggregates to:
-      - monthly weighted averages per ZIP (by Observation Count)
-      - annual weighted average per ZIP (same weight)
-    Returns: aqi_monthly, aqi_annual
+    Read and aggregate Air Quality Index (PM2.5) data
+    
+    Returns: tuple of (aqi_monthly, aqi_annual) DataFrames
     """
     df = pd.read_csv(file_path, low_memory=False)
 
-    # pick the right ZIP column (the file has ZIP twice; pandas may create 'ZIP' and 'ZIP.1')
+    # Handle multiple ZIP columns
     zip_cols = [c for c in df.columns if c.upper().startswith('ZIP')]
-    zip_col = zip_cols[-1]  # use the last occurrence
+    zip_col = zip_cols[-1]
     df['zip'] = df[zip_col].astype(str).str.extract(r'(\d{5})')[0].fillna('').str.zfill(5)
 
-    # ensure numeric
     val_col = 'Arithmetic Mean'
     w_col   = 'Observation Count'
     df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
     df[w_col]   = pd.to_numeric(df[w_col], errors='coerce').fillna(0)
 
-    # restrict to PM2.5 if multiple params exist
+    # Filter to PM2.5
     if 'Parameter Name' in df.columns:
         df = df[df['Parameter Name'].str.contains('PM2.5', na=False)]
 
-    # month parsing (your file has 'Month' like 'Jan-24'); fall back to Date Local if needed
+    # Parse dates
     if 'Month' in df.columns:
-        # robust parse for formats like 'Jan-24'
         df['month'] = pd.to_datetime(df['Month'], format='%b-%y', errors='coerce')
     else:
         df['month'] = pd.to_datetime(df['Date Local'], errors='coerce').values.astype('datetime64[M]')
 
-    # drop junk rows
     df = df.dropna(subset=['zip', 'month', val_col])
     df = df[df[w_col] > 0]
 
-    # ---- monthly weighted mean per ZIP ----
-    # weighted mean = sum(val * weight) / sum(weight)
+    # Monthly weighted averages
     grp = df.groupby(['zip', 'month'], as_index=False).apply(
         lambda g: pd.Series({
             'aqi_monthly': np.average(g[val_col], weights=g[w_col]),
@@ -91,7 +98,7 @@ def read_aqi_data(file_path):
         })
     ).reset_index(drop=True)
 
-    # ---- annual weighted mean per ZIP (across all months) ----
+    # Annual weighted averages
     grp_annual = df.groupby('zip', as_index=False).apply(
         lambda g: pd.Series({
             'aqi': np.average(g[val_col], weights=g[w_col]),
@@ -99,18 +106,69 @@ def read_aqi_data(file_path):
         })
     ).reset_index(drop=True)
 
-    # nice month label for display (YYYY-MM)
     grp['month_label'] = grp['month'].dt.strftime('%Y-%m')
 
     return grp[['zip', 'month', 'month_label', 'aqi_monthly', 'obs_month']], grp_annual[['zip', 'aqi', 'obs_total']]
 
 
+@st.cache_data
+def read_education_data_acs(year=2023, api_key=None):
+    """
+    Read ACS S1501 Educational Attainment by ZCTA.
+    Returns % HS or lower (25+) and % less than HS (25+).
+    """
+    import requests, pandas as pd
 
+    base = f"https://api.census.gov/data/{year}/acs/acs5/subject"
+    vars_ = [
+        "NAME",
+        "S1501_C02_007E",  # < 9th grade (25+), percent
+        "S1501_C02_008E",  # 9-12 no diploma (25+), percent
+        "S1501_C02_009E",  # HS grad incl. GED (25+), percent
+        "S1501_C02_014E",  # HS graduate or higher (25+), percent (optional check)
+        "S1501_C02_015E"   # Bachelor's degree or higher (25+), percent (optional)
+    ]
+
+    params = {
+        "get": ",".join(vars_),
+        "for": "zip code tabulation area:*"
+    }
+    if api_key:
+        params["key"] = api_key
+
+    r = requests.get(base, params=params, timeout=120)
+    #print(r.json())
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data[1:], columns=data[0])
+
+    # Clean names & types
+    df = df.rename(columns={
+        "zip code tabulation area": "zip",
+        "S1501_C02_007E": "pct_less_9",
+        "S1501_C02_008E": "pct_9to12_no_diploma",
+        "S1501_C02_009E": "pct_hs_grad",
+        "S1501_C02_014E": "pct_hs_or_higher",
+        "S1501_C02_015E": "pct_ba_or_higher"
+    })
+    num_cols = ["pct_less_9","pct_9to12_no_diploma","pct_hs_grad","pct_hs_or_higher","pct_ba_or_higher"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["zip"] = df["zip"].astype(str).str.zfill(5)
+
+    # Your targets
+    df["edu_hs_or_lower_pct"]   = df[["pct_less_9","pct_9to12_no_diploma","pct_hs_grad"]].sum(axis=1)
+    df["edu_less_than_hs_pct"]  = 100 - df["pct_hs_or_higher"]
+
+    return df[["zip","edu_hs_or_lower_pct","edu_less_than_hs_pct","pct_ba_or_higher"]]
+
+@st.cache_data
 def read_population_data(file_path):
-    # After 10 junk rows, the header starts with a leading comma
+    """Read population density and location data"""
     df = pd.read_csv(file_path, skiprows=10)
 
-    # Normalize column names (strip spaces)
     df.columns = [str(c).strip() for c in df.columns]
     lower = {c.lower(): c for c in df.columns}
 
@@ -133,7 +191,6 @@ def read_population_data(file_path):
     out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
     out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
 
-    # If multiple rows per ZIP, keep the max density and the first valid lat/lon
     out = (out.dropna(subset=["zip"])
               .groupby("zip", as_index=False)
               .agg({"pop_density":"max",
@@ -142,93 +199,286 @@ def read_population_data(file_path):
     return out
 
 
-
+@st.cache_data
 def read_pharmacy_data(file_path):
+    """Read pharmacy location data"""
     df = pd.read_csv(file_path)
-    #print(df.columns)
     df = df[['ZIP', 'NAME', 'X', 'Y']]
     return df
 
+
+@st.cache_data
 def read_health_data(file_path):
+    """Read health burden data from PLACES"""
     df = pd.read_csv(file_path)
     df = df[['ZCTA5', 'GHLTH_CrudePrev']]
     df['ZCTA5'] = df['ZCTA5'].astype(str).str.split('.').str[0].str.zfill(5)
     return df
 
-# --- read AI scores produced by your notebook ---
+
+@st.cache_data
+def read_hud_zip_county_crosswalk(path):
+    """
+    Read HUD ZIP↔County crosswalk; return [zip, county, state, weight].
+    Uses TOT_RATIO if present else RES_RATIO.
+    """
+    import os
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(path, dtype=str)
+    else:
+        df = pd.read_csv(path, dtype=str, low_memory=False)
+
+    cols = {c.lower(): c for c in df.columns}
+    zip_col    = cols.get("zip") or cols.get("zipcode") or cols.get("zip_code")
+    county_col = cols.get("county") or cols.get("county_fips") or cols.get("fips")
+    state_col  = cols.get("state") or cols.get("stabbr") or cols.get("stusps")
+
+    weight_col = None
+    for cand in ["tot_ratio", "total_ratio", "res_ratio"]:
+        if cand in cols:
+            weight_col = cols[cand]
+            break
+    if not (zip_col and county_col and weight_col):
+        raise ValueError("Crosswalk must have ZIP, COUNTY, and TOT_RATIO/RES_RATIO.")
+
+    out = pd.DataFrame({
+        "zip":    df[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+        "county": df[county_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+        "state":  (df[state_col] if state_col else pd.Series(index=df.index, dtype="object")),
+        "weight": pd.to_numeric(df[weight_col], errors="coerce").fillna(0.0)
+    })
+    out = out.dropna(subset=["zip","county"])
+    out = out[out["weight"] > 0]
+    return out
+
+
+
+@st.cache_data
+def read_county_desert_csv(path):
+    """
+    Read county-level desert dataset; return [county, county_desert, drive_time_min, desert_pop_pct].
+    
+    Extracts:
+    - county_desert: Binary flag (0 or 1) indicating if county is a pharmacy desert
+    - drive_time_min: Average drive time to nearest pharmacy in minutes
+    - desert_pop_pct: Percentage of population living in pharmacy desert
+    """
+    df = pd.read_csv(path, dtype=str, low_memory=False)
+    fips_col = next((c for c in df.columns if "fips" in c.lower()), None)
+    if not fips_col:
+        raise ValueError("County dataset must include a county FIPS column.")
+    df["county"] = df[fips_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+
+    # Extract binary desert flag
+    flag_col = next((c for c in df.columns if c.lower() in ["desert","is_desert","desert_flag","model1_pharm_desert","pharm_desert"]), None)
+    if flag_col:
+        val = pd.to_numeric(df[flag_col], errors="coerce").fillna(0.0).clip(0,1)
+    else:
+        score_col = next((c for c in df.columns if any(k in c.lower() for k in ["score","index","risk","prob"])), None)
+        if not score_col:
+            raise ValueError("No desert flag/score column found in county dataset.")
+        raw = pd.to_numeric(df[score_col], errors="coerce")
+        val = (raw - raw.min()) / (raw.max() - raw.min()) if raw.max() > raw.min() else 0.0
+
+    # Extract drive time in minutes
+    drive_time_col = next((c for c in df.columns if "drive_time" in c.lower() and "min" in c.lower()), None)
+    drive_time = pd.to_numeric(df[drive_time_col], errors="coerce") if drive_time_col else pd.Series(index=df.index, dtype=float)
+    
+    # Extract desert population percentage
+    desert_pop_col = next((c for c in df.columns if "desert_pop" in c.lower() and "pct" in c.lower()), None)
+    desert_pop_pct = pd.to_numeric(df[desert_pop_col], errors="coerce") if desert_pop_col else pd.Series(index=df.index, dtype=float)
+
+    out = pd.DataFrame({
+        "county": df["county"], 
+        "county_desert": val,
+        "drive_time_min": drive_time,
+        "desert_pop_pct": desert_pop_pct
+    })
+    return out.dropna(subset=["county"]).drop_duplicates(subset=["county"])
+
+
+@st.cache_data
+def downscale_county_to_zip(county_df, xwalk_df,
+                            tiny_cutoff=0.01, min_coverage=0.60, threshold=0.50):
+    xw = xwalk_df[xwalk_df["weight"] >= tiny_cutoff].copy()
+    totals = xw.groupby("zip", as_index=False)["weight"].sum().rename(columns={"weight":"zip_total"})
+
+    m = xw.merge(county_df, on="county", how="left")
+
+    # availability flags per metric
+    m["has_desert"] = m["county_desert"].notna()
+    m["has_drive"]  = m["drive_time_min"].notna()
+    m["has_pop"]    = m["desert_pop_pct"].notna()
+
+    # weighted values
+    m["w_desert"] = np.where(m["has_desert"], m["weight"] * m["county_desert"], 0.0)
+    m["w_drive"]  = np.where(m["has_drive"],  m["weight"] * m["drive_time_min"], 0.0)
+    m["w_pop"]    = np.where(m["has_pop"],    m["weight"] * m["desert_pop_pct"], 0.0)
+
+    agg = (m.groupby("zip", as_index=False)
+             .agg(zip_wsum=("weight","sum"),
+                  wmatch_desert=("weight", lambda s: s[m.loc[s.index, "has_desert"]].sum()),
+                  wmatch_drive =("weight", lambda s: s[m.loc[s.index, "has_drive"]].sum()),
+                  wmatch_pop   =("weight", lambda s: s[m.loc[s.index, "has_pop"]].sum()),
+                  wval_desert  =("w_desert","sum"),
+                  wval_drive   =("w_drive","sum"),
+                  wval_pop     =("w_pop","sum")))
+
+    out = agg.merge(totals, on="zip", how="left")
+    out["zip_total"] = out["zip_total"].replace(0, np.nan)
+
+    # coverage per metric
+    out["cov_desert"] = (out["wmatch_desert"] / out["zip_total"]).clip(0,1)
+    out["cov_drive"]  = (out["wmatch_drive"]  / out["zip_total"]).clip(0,1)
+    out["cov_pop"]    = (out["wmatch_pop"]    / out["zip_total"]).clip(0,1)
+
+    # renormalize each metric by its own matched weight
+    renorm_desert = out["wmatch_desert"] > 0
+    renorm_drive  = out["wmatch_drive"]  > 0
+    renorm_pop    = out["wmatch_pop"]    > 0
+
+    out.loc[renorm_desert, "zip_desert_share"]   = out.loc[renorm_desert, "wval_desert"] / out.loc[renorm_desert, "wmatch_desert"]
+    out.loc[renorm_drive,  "zip_drive_time"]     = out.loc[renorm_drive,  "wval_drive"]  / out.loc[renorm_drive,  "wmatch_drive"]
+    out.loc[renorm_pop,    "zip_desert_pop_pct"] = out.loc[renorm_pop,    "wval_pop"]    / out.loc[renorm_pop,    "wmatch_pop"]
+
+    # dominant-county fallback (per metric)
+    dom = (m.sort_values(["zip","weight"], ascending=[True, False])
+             .drop_duplicates("zip")[["zip","county_desert","drive_time_min","desert_pop_pct"]]
+             .rename(columns={"county_desert":"dom_desert","drive_time_min":"dom_drive","desert_pop_pct":"dom_pop"}))
+    out = out.merge(dom, on="zip", how="left")
+
+    for col_out, col_dom, cond in [
+        ("zip_desert_share", "dom_desert", out["zip_desert_share"].isna()),
+        ("zip_drive_time", "dom_drive", out["zip_drive_time"].isna()),
+        ("zip_desert_pop_pct", "dom_pop", out["zip_desert_pop_pct"].isna()),
+    ]:
+        out.loc[cond & out[col_dom].notna(), col_out] = out.loc[cond & out[col_dom].notna(), col_dom]
+
+    # state median fallback (per metric)
+    county_state = (xw.groupby(["county","state"], as_index=False)["weight"].sum()
+                      .sort_values(["county","weight"], ascending=[True, False])
+                      .drop_duplicates("county")[["county","state"]])
+    cws = county_df.merge(county_state, on="county", how="left")
+    state_med = (cws.dropna(subset=["state"])
+                   .groupby("state")
+                   .agg(state_desert=("county_desert","median"),
+                        state_drive =("drive_time_min","median"),
+                        state_pop   =("desert_pop_pct","median")))
+
+    zip_state = (xw.groupby(["zip","state"], as_index=False)["weight"].sum()
+                   .sort_values(["zip","weight"], ascending=[True, False])
+                   .drop_duplicates("zip")[["zip","state"]])
+
+    out = out.merge(zip_state, on="zip", how="left").merge(state_med, on="state", how="left")
+
+    for col_out, col_state in [
+        ("zip_desert_share", "state_desert"),
+        ("zip_drive_time", "state_drive"),
+        ("zip_desert_pop_pct", "state_pop"),
+    ]:
+        need = out[col_out].isna() & out[col_state].notna()
+        out.loc[need, col_out] = out.loc[need, col_state]
+
+    # coverage you use for gating = desert coverage (keep name stable)
+    out["zip_alloc_coverage"] = out["cov_desert"].fillna(0.0)
+
+    out["zip_desert_flag"] = (out["zip_desert_share"] >= threshold).astype("Int64")
+
+    # return useful coverage columns for transparency
+    return out[[
+        "zip","zip_desert_share","zip_desert_flag",
+        "zip_drive_time","zip_desert_pop_pct",
+        "zip_alloc_coverage","cov_drive","cov_pop"
+    ]].rename(columns={"cov_drive":"zip_alloc_cov_drive","cov_pop":"zip_alloc_cov_pop"})
+
+
+
+
 def read_ai_scores_csv(path='data/ai_scores.csv'):
+    """Read AI/ML scores from CSV (legacy function)"""
     try:
         df = pd.read_csv(path, dtype={'zip': str})
     except FileNotFoundError:
-        # no AI file yet; return empty frame so app still runs
         return pd.DataFrame(columns=['zip','ai_score'])
     df['zip'] = df['zip'].astype(str).str.extract(r'(\d{5})')[0].str.zfill(5)
     df = df.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
-    # If duplicates per ZIP exist, average them
     return df.groupby('zip', as_index=False)['ai_score'].mean()
 
 
-# --- export the mathematical score in case you want a CSV of it too ---
 def export_math_scores_csv(ranked_df, path='data/math_scores.csv'):
+    """Export mathematical scores to CSV"""
     out = ranked_df[['zip','score']].rename(columns={'score':'score_math'}).copy()
     out.to_csv(path, index=False)
     return out
 
 
-# --- average AI + math into final_score (with optional normalization) ---
+def norm01(s):
+    """Min-max normalize series to [0,1]"""
+    s = pd.to_numeric(s, errors='coerce')
+    if s.dropna().empty:
+        return s.fillna(0)
+    rng = s.max() - s.min()
+    return (s - s.min())/rng if rng else s*0
+
+
+@st.cache_data
 def average_scores(math_df, ai_df, normalize=True):
-    # math_df: columns zip, score_math
-    # ai_df:   columns zip, ai_score
+    """
+    Blend mathematical and AI scores
+    
+    Args:
+        math_df: DataFrame with columns [zip, score_math]
+        ai_df: DataFrame with columns [zip, ai_score]
+        normalize: Whether to normalize before averaging
+        
+    Returns:
+        DataFrame with columns [zip, final_score, score_math, ai_score]
+    """
     merged = pd.merge(math_df, ai_df, on='zip', how='outer')
 
-    def _norm01(s):
-        s = pd.to_numeric(s, errors='coerce')
-        if s.dropna().empty:
-            return s.fillna(0)
-        rng = s.max() - s.min()
-        return (s - s.min())/rng if rng else s*0
-
     if normalize:
-        merged['math_n'] = _norm01(merged['score_math'])
-        merged['ai_n']   = _norm01(merged['ai_score'])
-        # row-wise mean ignoring NaNs; if one is missing, the other carries through
+        merged['math_n'] = norm01(merged['score_math'])
+        merged['ai_n']   = norm01(merged['ai_score'])
         merged['final_score'] = merged[['math_n','ai_n']].mean(axis=1, skipna=True)
     else:
         merged['final_score'] = merged[['score_math','ai_score']].mean(axis=1, skipna=True)
 
-    # if BOTH missing, set to NaN → fill with 0 so sorting works
     merged['final_score'] = merged['final_score'].fillna(0)
 
     return merged[['zip','final_score','score_math','ai_score']]
 
 
-
-
-import numpy as np
-
-def norm01(s):
-    """Min-max normalize to [0,1]."""
-    s = pd.to_numeric(s, errors="coerce")
-    if s.dropna().empty:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    rng = s.max() - s.min()
-    return (s - s.min()) / rng if rng else pd.Series(np.zeros(len(s)), index=s.index)
-
+@st.cache_data
 def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=None):
-    # --- Income ---
+    """
+    Merge and preprocess all data sources
+    
+    Args:
+        financial: Financial/income DataFrame
+        health: Health burden DataFrame
+        pharmacy: Pharmacy locations DataFrame
+        population: Population density DataFrame
+        aqi_annual: Optional air quality DataFrame
+        hhi: Optional heat health index DataFrame
+        
+    Returns:
+        Merged and cleaned DataFrame
+    """
+    # Income
     fin = financial.copy()
     fin['zip'] = fin['NAME'].str.extract(r'(\d{5})')
     fin = fin.rename(columns={'S1901_C01_012E':'median_income'})[['zip','median_income']]
     fin['median_income'] = pd.to_numeric(fin['median_income'], errors='coerce')
     fin = fin.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
 
-    # --- Health (PLACES) ---
+    # Health
     hlth = health.copy()
     hlth['zip'] = hlth['ZCTA5'].astype(str).str.split('.').str[0].str.zfill(5)
     hlth = hlth.rename(columns={'GHLTH_CrudePrev':'health_burden'})[['zip','health_burden']]
     hlth = hlth.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
 
-    # --- Pharmacies -> counts ---
+    # Pharmacies
     pharm = pharmacy.copy()
     pharm['zip'] = pharm['ZIP'].astype(str).str.zfill(5)
     pharm_counts = (
@@ -238,27 +488,23 @@ def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=Non
              .reset_index(name='n_pharmacies')
     )
 
-    # --- Population density ---
-    pop = population.copy()  # has zip, pop_density, lat, lon
+    # Population
+    pop = population.copy()
     pop["pop_density"] = pd.to_numeric(pop["pop_density"], errors="coerce")
     pop["lat"] = pd.to_numeric(pop["lat"], errors="coerce")
     pop["lon"] = pd.to_numeric(pop["lon"], errors="coerce")
     pop = pop.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
-    # (optional) filter positives after you confirm values look right
-    # pop = pop[pop["pop_density"] > 0]
 
-
-
-    # --- Merge core ---
+    # Merge
     df = pharm_counts.merge(fin,  on='zip', how='outer') \
                      .merge(hlth, on='zip', how='outer') \
                      .merge(pop,  on='zip', how='outer')
 
-    # --- Optional AQI (annual) ---
+    # Optional: AQI
     if aqi_annual is not None and not aqi_annual.empty:
         df = df.merge(aqi_annual[['zip','aqi']], on='zip', how='left')
 
-    # --- Optional HHI (heat) ---
+    # Optional: HHI
     if hhi is not None and not hhi.empty:
         keep_cols = ['zip']
         if 'heat_hhb' in hhi.columns: keep_cols.append('heat_hhb')
@@ -268,6 +514,7 @@ def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=Non
 
     df['n_pharmacies'] = df['n_pharmacies'].fillna(0).astype(int)
     df['pop_density']  = df['pop_density'].fillna(0)
+    
     return df
 
 
@@ -437,95 +684,236 @@ def render_top10_map(top10: pd.DataFrame):
         st.dataframe(top10[keep])
 
 
+def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=0.0, w_heat=0.0, w_edu=0.0, w_drive_time=0.0):
+    """
+    Apply mathematical scoring model
+    
+    Args:
+        df: Preprocessed DataFrame
+        w_scarcity: Weight for pharmacy scarcity
+        w_health: Weight for health burden
+        w_income: Weight for income (inverted)
+        w_pop: Weight for population density
+        w_aqi: Weight for air quality
+        w_heat: Weight for heat vulnerability
+        w_edu: Weight for education (low attainment)
+        w_drive_time: Weight for driving time to nearest pharmacy (PRIMARY METRIC)
+        
+    Returns:
+        Scored and sorted DataFrame
+    """
+    eps = 1e-6
+    df['median_income'] = pd.to_numeric(df['median_income'], errors='coerce')
+    df['health_burden'] = pd.to_numeric(df['health_burden'], errors='coerce')
+    df['pop_density']   = pd.to_numeric(df['pop_density'], errors='coerce').fillna(0)
 
-def main():
-    st.title("Pharmacy Desert Explorer")
+    df['scarcity']   = 1 / (1 + df['n_pharmacies'])
 
-    # --- load your cleaned dataframes ---
-    financial_data = read_financial_data('data/financial_data.csv')
-    health_data    = read_health_data('data/health_data.csv')
-    pharmacy_data  = read_pharmacy_data('data/pharmacy_data.csv')
-    population_data= read_population_data('data/population_data.csv')
-    aqi_monthly, aqi_annual       = read_aqi_data('data/AQI_data.csv')
-    hhi = read_hhi_excel('data/HHI_data.xlsx')
+    df['scarcity_n'] = norm01(df['scarcity'])
+    df['health_n']   = norm01(df['health_burden'])
+    df['income_inv'] = 1 - norm01(df['median_income'])
+    df['pop_norm']   = norm01(df['pop_density'])
+    df['edu_low_norm'] = norm01(df['edu_hs_or_lower_pct'])
 
-    df = preprocess(financial_data, health_data, pharmacy_data, population_data,
-                aqi_annual=aqi_annual, hhi=hhi)
+    # Driving Time (PRIMARY METRIC) - higher minutes = worse access
+    if 'zip_drive_time' in df.columns and df['zip_drive_time'].notna().any():
+        df['drive_time_norm'] = norm01(df['zip_drive_time'])
+        # Fill missing values with median (neutral)
+        neutral = df['drive_time_norm'].median(skipna=True)
+        df['drive_time_norm'] = df['drive_time_norm'].fillna(neutral)
+    else:
+        df['drive_time_norm'] = 0.0
+        w_drive_time = 0.0
 
+    # AQI
+    if 'aqi' in df.columns and df['aqi'].notna().any():
+        df['aqi_norm'] = norm01(df['aqi'])
+        neutral = df['aqi_norm'].mean(skipna=True)
+        df['aqi_norm'] = df['aqi_norm'].fillna(neutral)
+    else:
+        df['aqi_norm'] = 0.0
+        w_aqi = 0.0
 
+    # HHI heat
+    if 'heat_hhb' in df.columns:
+        df['heat_norm'] = norm01(df['heat_hhb'])
+    else:
+        df['heat_norm'] = 0.0
+        w_heat = 0.0
 
-
-    # Sliders
-    st.sidebar.header("Adjust Weights")
-    w_scarcity = st.sidebar.slider("Scarcity (fewer pharmacies)", 0.0, 1.0, 0.30, 0.05)
-    w_health   = st.sidebar.slider("Health burden",               0.0, 1.0, 0.20, 0.05)
-    w_income   = st.sidebar.slider("Income (low → worse)",        0.0, 1.0, 0.10, 0.05)
-    w_pop      = st.sidebar.slider("Population density",          0.0, 1.0, 0.25, 0.05)
-
-    w_aqi  = st.sidebar.slider("Air quality (AQI)", 0.0, 1.0, 0.10, 0.05) if aqi_annual is not None else 0.0
-    w_heat = st.sidebar.slider("Heat (HHI - HHB_SCORE)", 0.0, 1.0, 0.15, 0.05) if hhi is not None else 0.0
-
-    total = w_scarcity + w_health + w_income + w_pop + w_aqi + w_heat
-    w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat = [w/total for w in [w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat]]
-
-    # --- your math ranking (already computed above) ---
-    ranked = score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=w_aqi, w_heat=w_heat)
-
-    # Ensure math score is numeric and drop rows with None/NaN math score
-    ranked['score'] = pd.to_numeric(ranked['score'], errors='coerce')
-    ranked = ranked.dropna(subset=['score'])
-
-    # Build a minimal math-scores df for merging
-    math_df = ranked[['zip', 'score']].rename(columns={'score': 'score_math'}).copy()
-
-    # Read AI CSV (IFAE)
-    ai_df = read_ifae_csv("results/national_ifae_rank.csv")
-
-    # Average (normalized) math + AI -> final_score
-    combo = average_scores(math_df, ai_df, normalize=True)
-
-    # Attach final_score, ai_score back to the full ranked frame
-    ranked = ranked.merge(combo, on='zip', how='left')
-
-        # ---- pick ONE column to rank by everywhere ----
-    sort_col = 'final_score' if 'final_score' in ranked.columns else 'score'
-
-    # force numeric and drop missing
-    ranked[sort_col] = pd.to_numeric(ranked[sort_col], errors='coerce')
-    ranked = ranked.dropna(subset=[sort_col])
-
-    # optional: make desert_flag numeric for deterministic sort
-    ranked['desert_flag'] = ranked['desert_flag'].astype(int)  # True=1, False=0
-
-    # deserts first, then highest score; stable sort and reset index
-    ranked = (
-        ranked.sort_values(['desert_flag', sort_col],
-                        ascending=[False, False],
-                        kind='mergesort',
-                        na_position='last')
-            .reset_index(drop=True)
-    )
-
-
-
-
-    # Show a few extra HHI columns if present
-    show_cols = ['zip','n_pharmacies','pop_density','median_income','health_burden']
-    if 'aqi' in ranked.columns:       
-        show_cols.append('aqi')
-    if 'heat_hhb' in ranked.columns:  
-        show_cols.append('heat_hhb')
-    # add the math/AI/final columns
-    show_cols += ['scarcity','pop_norm','income_inv','health_n','score_math','ai_score','final_score','desert_flag']
-    st.dataframe(ranked[show_cols].head(50))
-
-
-    st.write("### Top 10 ZIPs on the map")
-    top10 = ranked.head(10).copy()
-    render_top10_map(top10)
+    if 'edu_hs_or_lower_pct' in df.columns:
+        df['edu_low_norm'] = norm01(df['edu_hs_or_lower_pct'])
+    else:
+        df['edu_low_norm'] = 0.0
+        w_edu = 0.0
 
 
     
-    st.download_button("Download full CSV", ranked.to_csv(index=False), "pharmacy_desert_candidates.csv", "text/csv")
-if __name__ == "__main__":
-    main()
+    #no more power scaling
+    drive_time_score = df['drive_time_norm'] if w_drive_time > 0 else 0
+    scarcity_score = df['scarcity_n'].fillna(0) if w_scarcity > 0 else 0
+    health_score = df['health_n'].fillna(0) if w_health > 0 else 0
+    income_score = df['income_inv'].fillna(0) if w_income > 0 else 0
+    pop_score = df['pop_norm'].fillna(0) if w_pop > 0 else 0
+    aqi_score = df['aqi_norm'] if w_aqi > 0 else 0
+    heat_score = df['heat_norm'] if w_heat > 0 else 0
+    edu_score = df['edu_low_norm'].fillna(0) if w_edu > 0 else 0
+    
+    df['score'] = (w_drive_time * drive_time_score +
+                   w_scarcity  * scarcity_score    +
+                   w_health    * health_score      +
+                   w_income    * income_score      +
+                   w_pop       * pop_score         +
+                   w_aqi       * aqi_score         +
+                   w_heat      * heat_score        +
+                   w_edu       * edu_score)
+    
+    # Re-normalize final scores to [0, 1] for consistency
+    score_min = df['score'].min()
+    score_max = df['score'].max()
+    if score_max > score_min:
+        df['score'] = (df['score'] - score_min) / (score_max - score_min)
+
+    df['desert_flag'] = (df['n_pharmacies'] == 0)
+    
+    return df.sort_values(['desert_flag','score'], ascending=[False, False])
+
+
+@st.cache_data
+def read_population_labels(file_path):
+    """Read city/state labels for ZIPs"""
+    df = pd.read_csv(file_path, skiprows=10)
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+
+    zip_col  = lower.get("zip")
+    city_col = lower.get("city")
+    st_col   = lower.get("st") or lower.get("state")
+
+    if not zip_col:
+        return pd.DataFrame(columns=["zip","city","state"])
+
+    out = pd.DataFrame({"zip": df[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)})
+    if city_col: out["city"] = df[city_col].astype(str).str.strip()
+    if st_col:   out["state"] = df[st_col].astype(str).str.strip()
+    
+    return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+
+
+@st.cache_data
+def read_ifae_csv(path="results/national_ifae_rank.csv"):
+    """
+    Read Isolation Forest Autoencoder (IFAE) scores from notebook output
+    
+    Args:
+        path: Path to national_ifae_rank.csv from IF_AE_training.ipynb
+        
+    Returns:
+        DataFrame with columns [zip, ai_score]
+    """
+    try:
+        df = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str})
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["zip", "ai_score"])
+
+    df["zip"] = (
+        df["ZCTA5"].astype(str)
+        .str.extract(r"(\d{5})")[0]
+        .str.zfill(5)
+    )
+
+    df["ai_score"] = pd.to_numeric(df["IFAE_score"], errors="coerce")
+
+    out = df[["zip", "ai_score"]].dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+    return out
+
+
+def render_top10_map(top10: pd.DataFrame):
+    """
+    Render interactive Folium map for top 10 ZIPs
+    
+    Args:
+        top10: DataFrame with top 10 ranked ZIPs (must have lat/lon)
+    """
+    labels = read_population_labels('data/population_data.csv')
+    top10 = top10.merge(labels, on="zip", how="left")
+    top10["place"] = (
+        top10[["city", "state"]]
+        .fillna("")
+        .agg(lambda r: ", ".join([p for p in r if p]), axis=1)
+        .replace("", "(unknown)")
+    )
+
+    has_latlon_cols = {"lat","lon"}.issubset(top10.columns)
+    has_any_points = has_latlon_cols and top10[["lat","lon"]].notna().any().any()
+
+    if not has_any_points:
+        st.warning("No latitude/longitude data available in the population file.")
+        return
+
+    try:
+        import folium
+        from streamlit_folium import st_folium
+
+        pts = top10.dropna(subset=["lat","lon"]).copy()
+
+        fmap = folium.Map(
+            location=[float(pts["lat"].mean()), float(pts["lon"].mean())],
+            zoom_start=4, 
+            control_scale=True
+        )
+        
+        bounds = pts[["lat","lon"]].values.tolist()
+        if bounds:
+            fmap.fit_bounds(bounds, padding=(20, 20))
+
+        for _, r in pts.iterrows():
+            lat = float(r["lat"])
+            lon = float(r["lon"])
+            place = (f'{r.get("city","")}, {r.get("state","")}'.strip(", ") or "(unknown)")
+
+            # Build popup HTML with conditional drive time
+            drive_time_html = ""
+            if 'zip_drive_time' in r and pd.notna(r.get('zip_drive_time')):
+                drive_time_html = f"<b>🚗 Drive Time:</b> {r['zip_drive_time']:.1f} min<br>"
+            
+            popup = folium.Popup(
+                folium.IFrame(
+                    html=f"""
+                        <b>ZIP:</b> {r['zip']}<br>
+                        <b>Place:</b> {place}<br>
+                        {drive_time_html}
+                        <b>Final score:</b> {r.get('final_score', float('nan')):.3f}<br>
+                        <b>Math score:</b> {r.get('score_math', float('nan')):.3f}<br>
+                        <b>AI score:</b> {r.get('ai_score', float('nan')):.3f}<br>
+                        <b>Pharmacies:</b> {int(r['n_pharmacies'])}<br>
+                        <b>Pop density:</b> {r['pop_density']:.1f}
+                    """,
+                    width=260, height=190
+                ),
+                max_width=280
+            )
+            
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=max(5, min(20, 5 + 15*float(r.get("final_score", 0)))),
+                color=None, 
+                fill=True, 
+                fill_opacity=0.7,
+                popup=popup,
+            ).add_to(fmap)
+
+        st_folium(fmap, width=None)
+        
+    except ModuleNotFoundError:
+        st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
+        st.map(top10.dropna(subset=["lat","lon"])[["lat","lon"]], zoom=4, use_container_width=True)
+        keep = [c for c in ["zip","place","final_score","score_math","ai_score","n_pharmacies","pop_density"] if c in top10.columns]
+        st.dataframe(top10[keep])
+
+
+# ============================================================================
+# NOTE: The Streamlit UI has been moved to app.py
+# This file now contains only data processing functions
+# Run the app with: streamlit run app.py
+# ============================================================================
