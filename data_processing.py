@@ -23,6 +23,7 @@ def read_financial_data(file_path):
     df = pd.read_csv(file_path)
     df = df[['NAME', 'S1901_C01_012E']]
     df['zip'] = df['NAME'].str.extract(r'(\d{5})')
+    df['zip'] = df['NAME'].str.extract(r'(\d{5})')
     return df
 
 
@@ -515,6 +516,172 @@ def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=Non
     df['pop_density']  = df['pop_density'].fillna(0)
     
     return df
+
+
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+# reuse your reader functions
+# --- score: deserts first, then score ---
+def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=0.0, w_heat=0.0):
+    eps = 1e-6
+    df['median_income'] = pd.to_numeric(df['median_income'], errors='coerce')
+    df['health_burden'] = pd.to_numeric(df['health_burden'], errors='coerce')
+    df['pop_density']   = pd.to_numeric(df['pop_density'], errors='coerce').fillna(0)
+
+    per_density = df['n_pharmacies'] / (df['pop_density'] + eps)
+    df['scarcity']   = 1 / (1 + per_density)
+
+    df['scarcity_n'] = norm01(df['scarcity'])
+    df['health_n']   = norm01(df['health_burden'])
+    df['income_inv'] = 1 - norm01(df['median_income'])
+    df['pop_norm']   = norm01(df['pop_density'])
+
+    # AQI (higher is worse) — treat missing as neutral so ZIPs without AQI aren't penalized
+    if 'aqi' in df.columns and df['aqi'].notna().any():
+        df['aqi_norm'] = norm01(df['aqi'])
+        neutral = df['aqi_norm'].mean(skipna=True)
+        df['aqi_norm'] = df['aqi_norm'].fillna(neutral)
+    else:
+        df['aqi_norm'] = 0.0
+        w_aqi = 0.0
+
+
+    # HHI heat (higher is worse)
+    if 'heat_hhb' in df.columns:
+        df['heat_norm'] = norm01(df['heat_hhb'])
+    else:
+        df['heat_norm'] = 0.0
+        w_heat = 0.0
+
+    df['score'] = (w_scarcity*df['scarcity_n'].fillna(0) +
+                   w_health  *df['health_n'].fillna(0)   +
+                   w_income  *df['income_inv'].fillna(0) +
+                   w_pop     *df['pop_norm'].fillna(0)   +
+                   w_aqi     *df['aqi_norm']             +
+                   w_heat    *df['heat_norm'])
+
+    df['desert_flag'] = (df['n_pharmacies'] == 0)
+    return df.sort_values(['desert_flag','score'], ascending=[False, False])
+
+def read_population_labels(file_path):
+    """Light read of population CSV just to attach City/State by ZIP."""
+    df = pd.read_csv(file_path, skiprows=10)
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+
+    zip_col  = lower.get("zip")
+    city_col = lower.get("city")
+    st_col   = lower.get("st") or lower.get("state")
+
+    if not zip_col:
+        return pd.DataFrame(columns=["zip","city","state"])
+
+    out = pd.DataFrame({"zip": df[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)})
+    if city_col: out["city"] = df[city_col].astype(str).str.strip()
+    if st_col:   out["state"] = df[st_col].astype(str).str.strip()
+    return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+
+def read_ifae_csv(path="results/national_ifae_rank.csv"):
+    """
+    Reads the AI CSV with columns:
+    ZCTA5, IFAE_score, composite, iforest_anomaly, median_income, poor_health_pct,
+    population, pharmacies_count, pop_per_pharmacy, income_pct_inv, health_pct,
+    access_pct_inv, density_pct, pop_density, heat_hhb, heat_pct
+
+    Returns: DataFrame with ['zip','ai_score'] (ai_score from IFAE_score).
+    """
+    try:
+        df = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str})
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["zip", "ai_score"])
+
+    # 5-digit ZIP
+    df["zip"] = (
+        df["ZCTA5"].astype(str)
+        .str.extract(r"(\d{5})")[0]
+        .str.zfill(5)
+    )
+
+    # Use IFAE_score as the AI score (you can switch to 'composite' if you prefer)
+    df["ai_score"] = pd.to_numeric(df["IFAE_score"], errors="coerce")
+
+    # One row per zip
+    out = df[["zip", "ai_score"]].dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+    return out
+
+
+
+def render_top10_map(top10: pd.DataFrame):
+    """Show top 10 ZIPs with permanent labels; falls back if Folium isn't installed."""
+    # attach City/State for labels
+    labels = read_population_labels('data/population_data.csv')
+    top10 = top10.merge(labels, on="zip", how="left")
+    top10["place"] = (
+        top10[["city", "state"]]
+        .fillna("")
+        .agg(lambda r: ", ".join([p for p in r if p]), axis=1)
+        .replace("", "(unknown)")
+    )
+
+    # require only SOME lat/lon, not all
+    has_latlon_cols = {"lat","lon"}.issubset(top10.columns)
+    has_any_points = has_latlon_cols and top10[["lat","lon"]].notna().any().any()
+
+    if not has_any_points:
+        st.warning("No latitude/longitude data available in the population file.")
+        return
+
+    try:
+        import folium
+        from streamlit_folium import st_folium
+
+        pts = top10.dropna(subset=["lat","lon"]).copy()
+
+        # Fit map to the points
+        fmap = folium.Map(location=[float(pts["lat"].mean()), float(pts["lon"].mean())],
+                        zoom_start=4, control_scale=True)
+        bounds = pts[["lat","lon"]].values.tolist()
+        if bounds:
+            fmap.fit_bounds(bounds, padding=(20, 20))
+
+        for _, r in pts.iterrows():
+            lat = float(r["lat"]); lon = float(r["lon"])
+            place = (f'{r.get("city","")}, {r.get("state","")}'.strip(", ") or "(unknown)")
+
+            # main dot sized by score
+            popup = folium.Popup(
+                        folium.IFrame(
+                            html=f"""
+                                <b>ZIP:</b> {r['zip']}<br>
+                                <b>Place:</b> {place}<br>
+                                <b>Final score:</b> {r.get('final_score', float('nan')):.3f}<br>
+                                <b>Math score:</b> {r.get('score_math', float('nan')):.3f}<br>
+                                <b>AI score:</b> {r.get('ai_score', float('nan')):.3f}<br>
+                                <b>Pharmacies:</b> {int(r['n_pharmacies'])}<br>
+                                <b>Pop density:</b> {r['pop_density']:.1f}
+                            """,
+                            width=240, height=170
+                        ),
+                        max_width=260
+                    )
+            folium.CircleMarker(
+                        location=[lat, lon],
+                        radius=max(5, min(20, 5 + 15*float(r.get("final_score", 0)))),
+                        color=None, fill=True, fill_opacity=0.7,
+                        popup=popup,
+                    ).add_to(fmap)
+
+
+
+        st_folium(fmap, width=None)
+    except ModuleNotFoundError:
+        st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
+        st.map(top10.dropna(subset=["lat","lon"])[["lat","lon"]], zoom=4, use_container_width=True)
+        keep = [c for c in ["zip","place","final_score","score_math","ai_score","n_pharmacies","pop_density"] if c in top10.columns]
+        st.dataframe(top10[keep])
 
 
 def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=0.0, w_heat=0.0, w_edu=0.0, w_drive_time=0.0):
