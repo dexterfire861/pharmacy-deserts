@@ -15,7 +15,7 @@ if str(parent_dir) not in sys.path:
 
 from data_processing import (
     read_financial_data, read_health_data, read_pharmacy_data, read_population_data,
-    read_aqi_data, read_hhi_excel, read_ifae_csv, read_population_labels,
+    read_hhi_excel, read_ifae_csv, read_population_labels,
     read_education_data_acs, read_hud_zip_county_crosswalk, read_county_desert_csv,
     downscale_county_to_zip, preprocess, score_candidates, average_scores
 )
@@ -41,14 +41,13 @@ def main():
             health_data    = read_health_data('data/health_data.csv')
             pharmacy_data  = read_pharmacy_data('data/pharmacy_data.csv')
             population_data= read_population_data('data/population_data.csv')
-            aqi_monthly, aqi_annual = read_aqi_data('data/AQI_data.csv')
             hhi           = read_hhi_excel('data/HHI_data.xlsx')
             education     = read_education_data_acs(year=2023)
             hud_xwalk     = read_hud_zip_county_crosswalk("data/zip_county_cross.xlsx")
             county_df     = read_county_desert_csv("data/driving-time-desert.csv")
             zip_desert_df = downscale_county_to_zip(county_df, hud_xwalk, tiny_cutoff=0.01, min_coverage=0.60, threshold=0.50)
 
-            df = preprocess(financial_data, health_data, pharmacy_data, population_data, aqi_annual=aqi_annual, hhi=hhi)
+            df = preprocess(financial_data, health_data, pharmacy_data, population_data, hhi=hhi)
             df = df.merge(education[["zip","edu_hs_or_lower_pct"]], on='zip', how='left')
             df = df.merge(zip_desert_df, on='zip', how='left')
             st.success(f"Data loaded successfully! Analyzing {len(df):,} ZIP codes")
@@ -78,7 +77,6 @@ def main():
     w_pop      = st.sidebar.slider("Population density", 0.0, 1.0, 0.05, 0.05, disabled=slider_disabled)
 
     st.sidebar.markdown("**TERTIARY METRICS (optional):**")
-    w_aqi  = st.sidebar.slider("Air quality (AQI)", 0.0, 1.0, 0.03, 0.05, disabled=slider_disabled) if (('aqi' in df.columns) and df['aqi'].notna().any()) else 0.0
     w_heat = st.sidebar.slider("Heat vulnerability (HHI)", 0.0, 1.0, 0.05, 0.05, disabled=slider_disabled) if ('heat_hhb' in df.columns) else 0.0
     w_edu  = st.sidebar.slider("Education (low attainment)", 0.0, 1.0, 0.09, 0.05, disabled=slider_disabled) if ('edu_hs_or_lower_pct' in df.columns) else 0.0
 
@@ -90,17 +88,17 @@ def main():
     thr_goodrx  = st.sidebar.slider("Desert severity threshold (advanced)", 0.0, 1.0, 0.50, 0.05)
 
     # Normalize weights
-    total = w_drive_time + w_scarcity + w_health + w_income + w_pop + w_aqi + w_heat + w_edu
+    total = w_drive_time + w_scarcity + w_health + w_income + w_pop + w_heat + w_edu
     if total > 0:
-        w_drive_time, w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat, w_edu = [
-            w/total for w in [w_drive_time, w_scarcity, w_health, w_income, w_pop, w_aqi, w_heat, w_edu]
+        w_drive_time, w_scarcity, w_health, w_income, w_pop, w_heat, w_edu = [
+            w/total for w in [w_drive_time, w_scarcity, w_health, w_income, w_pop, w_heat, w_edu]
         ]
 
     st.sidebar.markdown("---")
     st.sidebar.caption("**Normalized Weights:**")
     if w_drive_time > 0: st.sidebar.caption(f"🚗 Drive Time: {w_drive_time:.2%}")
     for name,val in [("Scarcity",w_scarcity),("Health",w_health),("Income",w_income),("Population",w_pop),
-                     ("Air Quality",w_aqi),("Heat",w_heat),("Education",w_edu)]:
+                     ("Heat",w_heat),("Education",w_edu)]:
         if val > 0: st.sidebar.caption(f"{name}: {val:.2%}")
 
     # Hard gate (before scoring)
@@ -124,7 +122,7 @@ def main():
         st.caption(f"🔒 GoodRx hard gate ON · min HUD coverage ≥ {min_cov:.0%} · threshold ≥ {thr_goodrx:.0%}")
 
     # Score
-    ranked = score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_aqi=w_aqi, w_heat=w_heat, w_edu=w_edu, w_drive_time=w_drive_time)
+    ranked = score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_heat=w_heat, w_edu=w_edu, w_drive_time=w_drive_time)
     ranked['score'] = pd.to_numeric(ranked['score'], errors='coerce')
     ranked = ranked.dropna(subset=['score'])
     math_df = ranked[['zip','score']].rename(columns={'score':'score_math'}).copy()
@@ -187,7 +185,6 @@ def main():
         names, values = [], []
         if w_drive_time > 0: names.append('🚗 Drive Time'); values.append(w_drive_time)
         names += ['Scarcity','Health','Income','Population']; values += [w_scarcity,w_health,w_income,w_pop]
-        if w_aqi>0: names.append('Air Quality'); values.append(w_aqi)
         if w_heat>0: names.append('Heat'); values.append(w_heat)
         if w_edu>0: names.append('Education'); values.append(w_edu)
         fig = go.Figure(data=[go.Bar(x=names, y=values, text=[f'{v:.1%}' for v in values], textposition='auto')])
@@ -202,7 +199,7 @@ def main():
     if 'zip_drive_time' in ranked.columns: show_cols.append('zip_drive_time')
     for c in ["zip_desert_share","zip_desert_flag","zip_desert_flag_user","zip_desert_pop_pct","zip_alloc_coverage","zip_alloc_method"]:
         if c in ranked.columns: show_cols.append(c)
-    for c in ['aqi','heat_hhb','edu_hs_or_lower_pct']: 
+    for c in ['heat_hhb','edu_hs_or_lower_pct']: 
         if c in ranked.columns: show_cols.append(c)
     for c in ['scarcity','pop_norm','income_inv','health_n','score_math','ai_score','final_score']:
         if c in ranked.columns: show_cols.append(c)
@@ -214,7 +211,7 @@ def main():
         with c1:
             st.markdown("**Scores**: `score_math` (weighted), `ai_score` (IFAE), `final_score` (blend), `desert_flag` (0/1).")
         with c2:
-            st.markdown("**Features**: `scarcity`(inverse pharmacies), `health_n`, `income_inv`, `pop_norm`, optional: `drive_time_norm`, `aqi_norm`, `heat_norm`, `edu_low_norm`.")
+            st.markdown("**Features**: `scarcity`(inverse pharmacies), `health_n`, `income_inv`, `pop_norm`, optional: `drive_time_norm`, `heat_norm`, `edu_low_norm`.")
 
     st.dataframe(ranked[show_cols].head(50), use_container_width=True, height=400)
 

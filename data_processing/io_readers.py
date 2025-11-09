@@ -33,46 +33,6 @@ def read_hhi_excel(file_path):
     return out.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
 
 @cache_data
-def read_aqi_data(file_path):
-    df = pd.read_csv(file_path, low_memory=False)
-    zip_cols = [c for c in df.columns if c.upper().startswith('ZIP')]
-    zip_col = zip_cols[-1]
-    df['zip'] = df[zip_col].astype(str).str.extract(r'(\d{5})')[0].fillna('').str.zfill(5)
-
-    val_col = 'Arithmetic Mean'
-    w_col   = 'Observation Count'
-    df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
-    df[w_col]   = pd.to_numeric(df[w_col], errors='coerce').fillna(0)
-
-    if 'Parameter Name' in df.columns:
-        df = df[df['Parameter Name'].str.contains('PM2.5', na=False)]
-
-    if 'Month' in df.columns:
-        df['month'] = pd.to_datetime(df['Month'], format='%b-%y', errors='coerce')
-    else:
-        df['month'] = pd.to_datetime(df['Date Local'], errors='coerce').values.astype('datetime64[M]')
-
-    df = df.dropna(subset=['zip', 'month', val_col])
-    df = df[df[w_col] > 0]
-
-    grp = df.groupby(['zip', 'month'], as_index=False).apply(
-        lambda g: pd.Series({
-            'aqi_monthly': np.average(g[val_col], weights=g[w_col]),
-            'obs_month':   g[w_col].sum()
-        })
-    ).reset_index(drop=True)
-
-    grp_annual = df.groupby('zip', as_index=False).apply(
-        lambda g: pd.Series({
-            'aqi': np.average(g[val_col], weights=g[w_col]),
-            'obs_total': g[w_col].sum()
-        })
-    ).reset_index(drop=True)
-
-    grp['month_label'] = grp['month'].dt.strftime('%Y-%m')
-    return grp[['zip','month','month_label','aqi_monthly','obs_month']], grp_annual[['zip','aqi','obs_total']]
-
-@cache_data
 def read_education_data_acs(year=2023, api_key=None):
     import requests
     base = f"https://api.census.gov/data/{year}/acs/acs5/subject"

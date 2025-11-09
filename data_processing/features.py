@@ -8,7 +8,7 @@ def norm01(s: pd.Series) -> pd.Series:
     return (s - s.min())/rng if rng else s*0
 
 @cache_data
-def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=None):
+def preprocess(financial, health, pharmacy, population, hhi=None):
     fin = financial.copy()
     fin['zip'] = fin['NAME'].str.extract(r'(\d{5})')
     fin = fin.rename(columns={'S1901_C01_012E':'median_income'})[['zip','median_income']]
@@ -31,9 +31,6 @@ def preprocess(financial, health, pharmacy, population, aqi_annual=None, hhi=Non
     df = pharm_counts.merge(fin, on='zip', how='outer') \
                      .merge(hlth, on='zip', how='outer') \
                      .merge(pop,  on='zip', how='outer')
-
-    if aqi_annual is not None and not aqi_annual.empty:
-        df = df.merge(aqi_annual[['zip','aqi']], on='zip', how='left')
 
     if hhi is not None and not hhi.empty:
         keep_cols = ['zip'] + [c for c in ['heat_hhb','nbe_score','hhi_overall'] if c in hhi.columns]
