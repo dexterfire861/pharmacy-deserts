@@ -4,12 +4,11 @@ import numpy as np
 from utils.cache import cache_data
 
 def norm01(s):
-    """Min-max normalize series to [0,1]"""
+    """Percentile normalize series to [0,1]"""
     s = pd.to_numeric(s, errors='coerce')
     if s.dropna().empty:
         return s.fillna(0)
-    rng = s.max() - s.min()
-    return (s - s.min())/rng if rng else s*0
+    return s.rank(pct=True, method = 'average')
 
 @cache_data
 def read_financial_data(file_path):
@@ -31,46 +30,6 @@ def read_hhi_excel(file_path):
     if 'NBE_SCORE' in df.columns: out['nbe_score'] = pd.to_numeric(df['NBE_SCORE'], errors='coerce')
     if 'OVERALL_SCORE' in df.columns: out['hhi_overall'] = pd.to_numeric(df['OVERALL_SCORE'], errors='coerce')
     return out.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
-
-@cache_data
-def read_aqi_data(file_path):
-    df = pd.read_csv(file_path, low_memory=False)
-    zip_cols = [c for c in df.columns if c.upper().startswith('ZIP')]
-    zip_col = zip_cols[-1]
-    df['zip'] = df[zip_col].astype(str).str.extract(r'(\d{5})')[0].fillna('').str.zfill(5)
-
-    val_col = 'Arithmetic Mean'
-    w_col   = 'Observation Count'
-    df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
-    df[w_col]   = pd.to_numeric(df[w_col], errors='coerce').fillna(0)
-
-    if 'Parameter Name' in df.columns:
-        df = df[df['Parameter Name'].str.contains('PM2.5', na=False)]
-
-    if 'Month' in df.columns:
-        df['month'] = pd.to_datetime(df['Month'], format='%b-%y', errors='coerce')
-    else:
-        df['month'] = pd.to_datetime(df['Date Local'], errors='coerce').values.astype('datetime64[M]')
-
-    df = df.dropna(subset=['zip', 'month', val_col])
-    df = df[df[w_col] > 0]
-
-    grp = df.groupby(['zip', 'month'], as_index=False).apply(
-        lambda g: pd.Series({
-            'aqi_monthly': np.average(g[val_col], weights=g[w_col]),
-            'obs_month':   g[w_col].sum()
-        })
-    ).reset_index(drop=True)
-
-    grp_annual = df.groupby('zip', as_index=False).apply(
-        lambda g: pd.Series({
-            'aqi': np.average(g[val_col], weights=g[w_col]),
-            'obs_total': g[w_col].sum()
-        })
-    ).reset_index(drop=True)
-
-    grp['month_label'] = grp['month'].dt.strftime('%Y-%m')
-    return grp[['zip','month','month_label','aqi_monthly','obs_month']], grp_annual[['zip','aqi','obs_total']]
 
 @cache_data
 def read_education_data_acs(year=2023, api_key=None):
@@ -102,22 +61,24 @@ def read_population_data(file_path):
     df = pd.read_csv(file_path, skiprows=10)
     df.columns = [str(c).strip() for c in df.columns]
     lower = {c.lower(): c for c in df.columns}
-    required = ["zip", "density", "lat", "long"]
+    required = ["zip", "population", "density", "lat", "long"]
     if any(k not in lower for k in required):
-        raise ValueError(f"Expected columns Zip, density, lat, long; got {df.columns[:10].tolist()}")
-    zip_col  = lower["zip"]; dens_col = lower["density"]; lat_col  = lower["lat"]; lon_col  = lower["long"]
+        raise ValueError(f"Expected columns Zip, population, density, lat, long; got {df.columns[:10].tolist()}")
+    zip_col  = lower["zip"]; pop_col = lower["population"]; dens_col = lower["density"]; lat_col  = lower["lat"]; lon_col  = lower["long"]
 
     out = pd.DataFrame({
         "zip": df[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+        "population": df[pop_col].astype(str).str.replace(",", "", regex=False),
         "pop_density": df[dens_col].astype(str).str.replace(",", "", regex=False),
         "lat": df[lat_col], "lon": df[lon_col],
     })
+    out["population"] = pd.to_numeric(out["population"], errors="coerce")
     out["pop_density"] = pd.to_numeric(out["pop_density"], errors="coerce")
     out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
     out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
     return (out.dropna(subset=["zip"])
               .groupby("zip", as_index=False)
-              .agg({"pop_density":"max","lat":"first","lon":"first"}))
+              .agg({"population":"sum","pop_density":"max","lat":"first","lon":"first"}))
 
 @cache_data
 def read_pharmacy_data(file_path):

@@ -395,18 +395,57 @@ with Step("Load HEALTH (poor general health %)"):
     hlth = hlth[["ZCTA5","GHLTH_CrudePrev"]]
     stamp(f"HEALTH rows={len(hlth)}, null health%={hlth['GHLTH_CrudePrev'].isna().sum()}")
 
-with Step("Load PHARMACY (NPI Excel bundle: .xlsm/.xlsx)"):
-    try:
-        ph_cnt, region_df, centroids = load_npi_pharmacy_bundle(NPI_GLOBS)
-        stamp(f"PHARMACY unique ZCTA5={ph_cnt['ZCTA5'].nunique()}, pharmacies={ph_cnt['pharmacies_count'].sum():,}")
-        TOTAL_PHARM = int(ph_cnt["pharmacies_count"].sum())
-    except Exception as e:
-        stamp(f"WARNING: {e}")
-        stamp("PHARMACY data missing. Will neutralize the access feature (set to 0.5).")
-        ph_cnt = pd.DataFrame(columns=["ZCTA5","pharmacies_count"])
-        region_df = pd.DataFrame(columns=["ZCTA5","REGION"])
+with Step("Load PHARMACY (CSV or NPI Excel bundle)"):
+    # Try CSV first (simpler and more reliable)
+    csv_path = Path("data/pharmacy_data.csv")
+    if csv_path.exists():
+        stamp(f"Using CSV pharmacy data: {csv_path}")
+        ph = read_csv_smart(str(csv_path))
+        if "ZIP" not in ph.columns or "NAME" not in ph.columns:
+            raise KeyError("pharmacy_data.csv must contain ZIP and NAME columns")
+        
+        ph["ZCTA5"] = coerce_zcta(ph["ZIP"])
+        ph_cnt = ph.groupby("ZCTA5", dropna=False)["NAME"].nunique(dropna=True).reset_index().rename(columns={"NAME":"pharmacies_count"})
+        
+        # Extract region (prefer STATE)
+        region_df = None
+        for rcol in ["STATE","state","STATEFP","statefp","county","COUNTY","county_fips"]:
+            if rcol in ph.columns:
+                region_df = ph[["ZCTA5", rcol]].drop_duplicates("ZCTA5").rename(columns={rcol:"REGION"})
+                break
+        if region_df is None:
+            region_df = ph[["ZCTA5"]].drop_duplicates().assign(REGION="ALL")
+        
+        # Extract centroids from lon/lat if available
         centroids = pd.DataFrame(columns=["ZCTA5","LON","LAT"])
-        TOTAL_PHARM = 0
+        lon_col = pick_first("lon","longitude","LON","LONGITUDE","X","x", in_df=ph)
+        lat_col = pick_first("lat","latitude","LAT","LATITUDE","Y","y", in_df=ph)
+        if lon_col and lat_col:
+            tmp = ph[[lon_col, lat_col, "ZCTA5"]].copy()
+            tmp[lon_col] = pd.to_numeric(tmp[lon_col], errors='coerce')
+            tmp[lat_col] = pd.to_numeric(tmp[lat_col], errors='coerce')
+            good = tmp[lon_col].between(-180,180) & tmp[lat_col].between(-90,90)
+            if good.any():
+                centroids = tmp[good].groupby("ZCTA5", as_index=False).agg(
+                    LON=(lon_col, "mean"),
+                    LAT=(lat_col, "mean")
+                )
+        
+        TOTAL_PHARM = int(ph_cnt["pharmacies_count"].sum())
+        stamp(f"PHARMACY unique ZCTA5={ph_cnt['ZCTA5'].nunique()}, pharmacies={TOTAL_PHARM:,}")
+    else:
+        # Fallback to Excel
+        try:
+            ph_cnt, region_df, centroids = load_npi_pharmacy_bundle(NPI_GLOBS)
+            stamp(f"PHARMACY unique ZCTA5={ph_cnt['ZCTA5'].nunique()}, pharmacies={ph_cnt['pharmacies_count'].sum():,}")
+            TOTAL_PHARM = int(ph_cnt["pharmacies_count"].sum())
+        except Exception as e:
+            stamp(f"WARNING: {e}")
+            stamp("PHARMACY data missing. Will neutralize the access feature (set to 0.5).")
+            ph_cnt = pd.DataFrame(columns=["ZCTA5","pharmacies_count"])
+            region_df = pd.DataFrame(columns=["ZCTA5","REGION"])
+            centroids = pd.DataFrame(columns=["ZCTA5","LON","LAT"])
+            TOTAL_PHARM = 0
 
 with Step("Load POPULATION (ACS ZCTA; try skiprows=10 then 0)"):
     try:
@@ -548,7 +587,7 @@ if df["pharmacies_count"].sum() > 0:
         # Simple, stable formula
         formula_cv = "pharmacies_count ~ 1 + income_pct_inv_c + health_pct_c + density_pct_c"
 
-        y_cv, X_cv = dmatrices(formula_cv, work, return_type="dataframe", eval_env=1)
+        y_cv, X_cv = dmatrices(formula_cv, work, return_type="dataframe", eval_env=0)
         valid_idx = X_cv.index
         y = y_cv.iloc[:, 0]
         exposure_all = work.loc[valid_idx, "population"].clip(lower=1.0).astype(float)
@@ -693,7 +732,7 @@ if glm_done:
             work[c + "_c"] = work[c] - 0.5
 
         formula_full = "pharmacies_count ~ 1 + income_pct_inv_c + health_pct_c + density_pct_c + C(REGION)"
-        y_full, X_full = dmatrices(formula_full, work, return_type="dataframe", eval_env=1)
+        y_full, X_full = dmatrices(formula_full, work, return_type="dataframe", eval_env=0)
         idx_full = X_full.index
         exp_full = work.loc[idx_full, "population"].clip(lower=1.0).astype(float)
 

@@ -95,7 +95,7 @@ streamlit run app.py
 ### Demo Flow:
 1. Show `IF_AE_training.ipynb` briefly
    - "This trains our Isolation Forest AI model"
-   - "It analyzes income, health, pharmacy access, heat, air quality"
+   - "It analyzes income, health, pharmacy access, heat, and education"
    
 2. Run `app.py`
    - "This is our interactive tool"
