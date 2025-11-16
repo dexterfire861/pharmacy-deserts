@@ -24,7 +24,7 @@ def preprocess(financial, health, pharmacy, population, hhi=None):
     pharm_counts = (pharm.dropna(subset=['zip']).groupby('zip').size().reset_index(name='n_pharmacies'))
 
     pop = population.copy()
-    for c in ("pop_density","lat","lon"):
+    for c in ("pop_density","lat","lon", "population"):
         pop[c] = pd.to_numeric(pop[c], errors="coerce")
     pop = pop.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
 
@@ -38,4 +38,5 @@ def preprocess(financial, health, pharmacy, population, hhi=None):
 
     df['n_pharmacies'] = df['n_pharmacies'].fillna(0).astype(int)
     df['pop_density']  = df['pop_density'].fillna(0)
+    df['population']   = df['population'].fillna(0)
     return df

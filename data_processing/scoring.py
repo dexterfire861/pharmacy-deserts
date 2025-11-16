@@ -25,9 +25,16 @@ def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_heat=0.0, w_ed
     df['health_burden'] = pd.to_numeric(df['health_burden'], errors='coerce')
     df['pop_density']   = pd.to_numeric(df['pop_density'],  errors='coerce').fillna(0)
 
-    df['scarcity']    = 1 / (1 + df['n_pharmacies'])
+    # Scarcity
+    # Estimate population from density (assuming average ZIP area ~100 km²)
+    df['pharmacies_per_10k'] = (df['n_pharmacies'] / (df['population'] + 1)) * 10000
+    df['scarcity'] = 1 / (1 + df['pharmacies_per_10k'])
     df['scarcity_n']  = norm01(df['scarcity'])
+
+    # Health
     df['health_n']    = norm01(df['health_burden'])
+
+    # Income
     df['income_inv']  = 1 - norm01(df['median_income'])
     df['pop_norm']    = norm01(df['pop_density'])
 
@@ -47,7 +54,7 @@ def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_heat=0.0, w_ed
     else:
         df['heat_norm'] = 0.0; w_heat = 0.0
 
-    drive_time_score = df['drive_time_norm'] if w_drive_time > 0 else 0
+    drive_time_score = df['drive_time_norm'].fillna(0) if w_drive_time > 0 else 0
     scarcity_score   = df['scarcity_n'].fillna(0) if w_scarcity > 0 else 0
     health_score     = df['health_n'].fillna(0)   if w_health   > 0 else 0
     income_score     = df['income_inv'].fillna(0) if w_income   > 0 else 0
@@ -62,5 +69,9 @@ def score_candidates(df, w_scarcity, w_health, w_income, w_pop, w_heat=0.0, w_ed
     if smax > smin:
         df['score'] = (df['score'] - smin) / (smax - smin)
 
-    df['desert_flag'] = (df['n_pharmacies'] == 0)
+    df['pharm_per_10k'] = (df['n_pharmacies'] / (df['population'] + 1)) * 10000
+
+    # pick a simple threshold (tune this!)
+    # e.g. fewer than 1 pharmacy per 10,000 people
+    df['desert_flag'] = df['pharm_per_10k'] < 2.0
     return df.sort_values(['desert_flag','score'], ascending=[False, False])

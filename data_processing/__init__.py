@@ -9,6 +9,8 @@ from .desert_downscale import (
 from .features import preprocess, norm01
 from .scoring import score_candidates, average_scores, export_math_scores_csv
 from .ml_ifae import read_ifae_csv
+from .pharmacist_loader import load_all_pharmacist_data, get_pharmacists_for_zip
+from .glm_training import run_glm_training
 
 # Don't import render_top10_map here - let app.py import it directly from viz.map_viz
 # to avoid circular import issues with relative paths
