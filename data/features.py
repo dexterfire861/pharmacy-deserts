@@ -1,0 +1,69 @@
+# pharmacy_deserts/data/features.py
+"""
+Feature engineering and preprocessing functions for pharmacy desert analysis.
+"""
+import pandas as pd
+from utils.cache import cache_data
+
+
+def norm01(s: pd.Series) -> pd.Series:
+    """Min-max normalize series to [0,1]."""
+    s = pd.to_numeric(s, errors='coerce')
+    if s.dropna().empty:
+        return s.fillna(0)
+    rng = s.max() - s.min()
+    return (s - s.min()) / rng if rng else s * 0
+
+
+@cache_data
+def preprocess(financial, health, pharmacy, population, hhi=None):
+    """
+    Merge and preprocess all data sources.
+
+    Args:
+        financial: Financial/income DataFrame
+        health: Health burden DataFrame
+        pharmacy: Pharmacy locations DataFrame
+        population: Population density DataFrame
+        hhi: Optional heat health index DataFrame
+
+    Returns:
+        Merged and cleaned DataFrame
+    """
+    fin = financial.copy()
+    fin['zip'] = fin['NAME'].str.extract(r'(\d{5})')
+    fin = fin.rename(columns={'S1901_C01_012E': 'median_income'})[['zip', 'median_income']]
+    fin['median_income'] = pd.to_numeric(fin['median_income'], errors='coerce')
+    fin = fin.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
+
+    hlth = health.copy()
+    hlth['zip'] = hlth['ZCTA5'].astype(str).str.split('.').str[0].str.zfill(5)
+    hlth = hlth.rename(columns={'GHLTH_CrudePrev': 'health_burden'})[['zip', 'health_burden']]
+    hlth = hlth.dropna(subset=['zip']).drop_duplicates(subset=['zip'])
+
+    pharm = pharmacy.copy()
+    # Handle both uppercase ZIP and lowercase zip column names
+    zip_col = 'ZIP' if 'ZIP' in pharm.columns else 'zip' if 'zip' in pharm.columns else None
+    if zip_col is None:
+        raise KeyError(f"Pharmacy data must contain 'ZIP' or 'zip' column. Found: {pharm.columns.tolist()}")
+    pharm['zip'] = pharm[zip_col].astype(str).str.zfill(5)
+    pharm_counts = (pharm.dropna(subset=['zip']).groupby('zip').size().reset_index(name='n_pharmacies'))
+
+    pop = population.copy()
+    for c in ("pop_density", "lat", "lon", "population"):
+        pop[c] = pd.to_numeric(pop[c], errors="coerce")
+    pop = pop.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+
+    df = pharm_counts.merge(fin, on='zip', how='outer') \
+                     .merge(hlth, on='zip', how='outer') \
+                     .merge(pop, on='zip', how='outer')
+
+    if hhi is not None and not hhi.empty:
+        keep_cols = ['zip'] + [c for c in ['heat_hhb', 'nbe_score', 'hhi_overall'] if c in hhi.columns]
+        df = df.merge(hhi[keep_cols], on='zip', how='left')
+
+    df['n_pharmacies'] = df['n_pharmacies'].fillna(0).astype(int)
+    df['pop_density'] = df['pop_density'].fillna(0)
+    df['population'] = df['population'].fillna(0)
+    return df
+
