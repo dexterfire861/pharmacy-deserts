@@ -1,21 +1,24 @@
 # pharmacy_deserts/viz/map_viz.py
 import pandas as pd
 import streamlit as st
-from data_processing.io_readers import read_population_labels
-from data_processing.pharmacist_loader import load_all_pharmacist_data, get_pharmacists_for_zip
+from data.loaders import read_population_labels, get_pharmacists_for_zip
 
 # Import health data parser
 try:
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent / 'data'))
+    sys.path.insert(0, str(Path(__file__).parent.parent / 'raw_data'))
     from health_data_parser import format_health_stats_html
 except ImportError:
     def format_health_stats_html(zip_code):
         return ""  # Fallback if health data not available
 
 def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
-    labels = read_population_labels('data/population_data.csv')
+    """
+    Render an interactive map of top pharmacy desert ZIPs.
+    Note: Returns HTML, so parent should handle display to avoid reruns on interaction.
+    """
+    labels = read_population_labels('raw_data/population_data.csv')
     top10 = top10.merge(labels, on="zip", how="left")
     
     # Create place string from city and state
@@ -139,7 +142,8 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
                 color=None, fill=True, fill_opacity=0.7, popup=popup
             ).add_to(fmap)
 
-        st_folium(fmap, width=None)
+        # Use key to prevent reruns on map interaction
+        st_folium(fmap, width=None, key="pharmacy_map", returned_objects=[])
     except ModuleNotFoundError:
         st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
         st.map(top10.dropna(subset=["lat","lon"])[["lat","lon"]], zoom=4, use_container_width=True)

@@ -1,0 +1,59 @@
+# Docker ignore file
+# Rename this to .dockerignore
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files (contain secrets)
+.env
+*.env
+
+# Large data files (load from S3 instead)
+raw_data/
+results/
+*.csv
+*.xlsx
+*.xlsm
+*.zip
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Documentation
+*.md
+docs/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
