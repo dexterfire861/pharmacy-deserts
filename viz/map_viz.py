@@ -2,6 +2,7 @@
 import pandas as pd
 import streamlit as st
 from data.loaders import read_population_labels, get_pharmacists_for_zip
+from app.config import get_config
 
 # Import health data parser
 try:
@@ -13,12 +14,41 @@ except ImportError:
     def format_health_stats_html(zip_code):
         return ""  # Fallback if health data not available
 
+
+def _get_population_labels():
+    """Get population labels from local or S3 based on environment."""
+    config = get_config()
+    
+    if config.is_production and config.aws_s3_bucket:
+        # Load from S3
+        from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
+        import io
+        
+        s3_path = config.get_population_data_path()
+        bucket, key = parse_s3_path(s3_path)
+        data = download_s3_file_to_memory(bucket, key)
+        
+        df = pd.read_csv(io.BytesIO(data), skiprows=10)
+        df.columns = [str(c).strip() for c in df.columns]
+        lower = {c.lower(): c for c in df.columns}
+        
+        result = pd.DataFrame({
+            "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+            "city": df[lower.get("city", lower.get("place", "zip"))].astype(str) if "city" in lower or "place" in lower else "",
+            "state": df[lower.get("state", lower.get("st", "zip"))].astype(str) if "state" in lower or "st" in lower else "",
+        })
+        return result.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+    else:
+        # Load from local filesystem
+        return read_population_labels('raw_data/population_data.csv')
+
+
 def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
     """
     Render an interactive map of top pharmacy desert ZIPs.
     Note: Returns HTML, so parent should handle display to avoid reruns on interaction.
     """
-    labels = read_population_labels('raw_data/population_data.csv')
+    labels = _get_population_labels()
     top10 = top10.merge(labels, on="zip", how="left")
     
     # Create place string from city and state
