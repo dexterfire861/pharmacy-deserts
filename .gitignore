@@ -1,23 +1,75 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
 venv/
 env/
 ENV/
 .venv
+.env
+.env.local
+.env.production
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Streamlit
+.streamlit/
+
+# Local data directories (keep structure but not actual data)
+raw_data/datasets/*/versions/*/files/
+temp_uploads/
 
 # Large data files
 data/AQI_data.csv
 *.csv.zip
 *.zip
+*.xlsx
+# Keep example/template files but exclude large data files
+!env.example
 
-# IDE
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Logs
+*.log
 .vscode/
 .idea/
 *.swp

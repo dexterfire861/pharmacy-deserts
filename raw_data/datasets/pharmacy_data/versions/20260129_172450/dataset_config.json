@@ -1,0 +1,81 @@
+{
+  "dataset_id": "pharmacy_data",
+  "version_id": "20260129_172450",
+  "created_at": "2026-01-29T17:24:50.513376",
+  "sources": [
+    {
+      "filename": "population_data.csv",
+      "file_type": "csv",
+      "sheet_name": null,
+      "skip_rows": 10,
+      "zip_column": "Zip",
+      "normalization_mode": "already_5_digit",
+      "feature_columns": [
+        "density",
+        "lat",
+        "long",
+        "population",
+        "City",
+        "St"
+      ],
+      "column_renames": {
+        "density": "pop_density",
+        "lat": "latitude",
+        "long": "longitude",
+        "population": "population",
+        "City": "city",
+        "St": "state"
+      },
+      "cleaning_rules": {
+        "drop_null_columns": [
+          "Zip",
+          "lat",
+          "long"
+        ]
+      }
+    },
+    {
+      "filename": "financial_data.csv",
+      "file_type": "csv",
+      "sheet_name": null,
+      "skip_rows": 0,
+      "zip_column": "GEO_ID",
+      "normalization_mode": "extract_5_digit_regex",
+      "feature_columns": [
+        "S1901_C01_012E"
+      ],
+      "column_renames": {
+        "S1901_C01_012E": "median_income"
+      },
+      "cleaning_rules": {
+        "drop_null_columns": [
+          "GEO_ID",
+          "S1901_C01_012E"
+        ]
+      }
+    }
+  ],
+  "status": "active",
+  "scoring_config": {
+    "column_mappings": [
+      {
+        "source_column": "pop_density",
+        "target_component": "pop_density",
+        "transform": null
+      },
+      {
+        "source_column": "population",
+        "target_component": "population",
+        "transform": null
+      },
+      {
+        "source_column": "median_income",
+        "target_component": "income",
+        "transform": null
+      }
+    ],
+    "weight_overrides": {},
+    "desert_threshold": 2.0,
+    "normalize_scores": true
+  }
+}

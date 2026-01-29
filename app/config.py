@@ -38,6 +38,9 @@ class Config:
     data_dir: str = 'raw_data'
     results_dir: str = 'results'
     
+    # Dataset configuration
+    active_dataset_id: Optional[str] = None  # Load from this dataset config instead of default files
+    
     # Streamlit settings
     server_port: int = 8501
     server_headless: bool = True
@@ -103,6 +106,7 @@ def load_config() -> Config:
         require_auth=os.getenv('REQUIRE_AUTH', 'false').lower() == 'true',
         data_dir=os.getenv('DATA_DIR', 'raw_data'),
         results_dir=os.getenv('RESULTS_DIR', 'results'),
+        active_dataset_id=os.getenv('ACTIVE_DATASET_ID'),
         server_port=int(os.getenv('STREAMLIT_SERVER_PORT', '8501')),
         server_headless=os.getenv('STREAMLIT_SERVER_HEADLESS', 'true').lower() == 'true',
     )

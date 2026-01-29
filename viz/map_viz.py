@@ -16,31 +16,44 @@ except ImportError:
 
 
 def _get_population_labels():
-    """Get population labels from local or S3 based on environment."""
+    """
+    Get population labels from local or S3 based on environment.
+    Returns empty DataFrame if file not found (map will work but without city/state labels).
+    """
     config = get_config()
     
-    if config.is_production and config.aws_s3_bucket:
-        # Load from S3
-        from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
-        import io
-        
-        s3_path = config.get_population_data_path()
-        bucket, key = parse_s3_path(s3_path)
-        data = download_s3_file_to_memory(bucket, key)
-        
-        df = pd.read_csv(io.BytesIO(data), skiprows=10)
-        df.columns = [str(c).strip() for c in df.columns]
-        lower = {c.lower(): c for c in df.columns}
-        
-        result = pd.DataFrame({
-            "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
-            "city": df[lower.get("city", lower.get("place", "zip"))].astype(str) if "city" in lower or "place" in lower else "",
-            "state": df[lower.get("state", lower.get("st", "zip"))].astype(str) if "state" in lower or "st" in lower else "",
-        })
-        return result.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
-    else:
-        # Load from local filesystem
-        return read_population_labels('raw_data/population_data.csv')
+    try:
+        if config.is_production and config.aws_s3_bucket:
+            # Load from S3
+            from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
+            import io
+            
+            s3_path = config.get_population_data_path()
+            bucket, key = parse_s3_path(s3_path)
+            data = download_s3_file_to_memory(bucket, key)
+            
+            df = pd.read_csv(io.BytesIO(data), skiprows=10)
+            df.columns = [str(c).strip() for c in df.columns]
+            lower = {c.lower(): c for c in df.columns}
+            
+            result = pd.DataFrame({
+                "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+                "city": df[lower.get("city", lower.get("place", "zip"))].astype(str) if "city" in lower or "place" in lower else "",
+                "state": df[lower.get("state", lower.get("st", "zip"))].astype(str) if "state" in lower or "st" in lower else "",
+            })
+            return result.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+        else:
+            # Load from local filesystem - check if file exists first
+            from pathlib import Path
+            local_path = Path('raw_data/population_data.csv')
+            if not local_path.exists():
+                # Return empty DataFrame - map will work but without city/state labels
+                return pd.DataFrame(columns=["zip", "city", "state"])
+            return read_population_labels(str(local_path))
+    except Exception as e:
+        # If anything fails, return empty DataFrame
+        print(f"Warning: Could not load population labels: {e}")
+        return pd.DataFrame(columns=["zip", "city", "state"])
 
 
 def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
@@ -48,8 +61,22 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
     Render an interactive map of top pharmacy desert ZIPs.
     Note: Returns HTML, so parent should handle display to avoid reruns on interaction.
     """
-    labels = _get_population_labels()
-    top10 = top10.merge(labels, on="zip", how="left")
+    # Check if city/state columns already exist in the dataframe
+    has_city = 'city' in top10.columns and top10['city'].notna().any()
+    has_state = 'state' in top10.columns and top10['state'].notna().any()
+    
+    # Only merge with labels file if city/state not already present
+    if not (has_city and has_state):
+        labels = _get_population_labels()
+        if not labels.empty:
+            # Merge but don't overwrite existing columns
+            merge_cols = ['zip']
+            if not has_city and 'city' in labels.columns:
+                merge_cols.append('city')
+            if not has_state and 'state' in labels.columns:
+                merge_cols.append('state')
+            if len(merge_cols) > 1:
+                top10 = top10.merge(labels[merge_cols], on="zip", how="left")
     
     # Create place string from city and state
     def make_place(row):
@@ -66,10 +93,45 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
     
     top10["place"] = top10.apply(make_place, axis=1)
 
-    has_latlon_cols = {"lat","lon"}.issubset(top10.columns)
+    # Check for lat/lon columns (might be named differently)
+    lat_col = None
+    lon_col = None
+    
+    # Check all possible column name variations
+    lat_names = ['lat', 'latitude', 'Lat', 'Latitude', 'LAT', 'LATITUDE']
+    lon_names = ['lon', 'lng', 'long', 'longitude', 'Lon', 'Lng', 'Long', 'Longitude', 'LON', 'LNG', 'LONG', 'LONGITUDE']
+    
+    for col in top10.columns:
+        if col in lat_names or col.lower() in ['lat', 'latitude']:
+            lat_col = col
+        elif col in lon_names or col.lower() in ['lon', 'lng', 'long', 'longitude']:
+            lon_col = col
+    
+    has_latlon_cols = lat_col is not None and lon_col is not None
+    
+    # Standardize column names if found
+    if has_latlon_cols:
+        if lat_col != 'lat':
+            top10['lat'] = top10[lat_col]
+        if lon_col != 'lon':
+            top10['lon'] = top10[lon_col]
+    
     has_any_points = has_latlon_cols and top10[["lat","lon"]].notna().any().any()
+    
     if not has_any_points:
-        st.warning("No latitude/longitude data available in the population file.")
+        # Show what columns ARE available for debugging
+        available_cols = list(top10.columns)
+        st.info(f"📍 Map unavailable - no lat/lon data found. Available columns: {available_cols[:15]}{'...' if len(available_cols) > 15 else ''}")
+        
+        # Show a simple table of the top ZIPs instead
+        display_cols = ['zip', 'place']
+        for col in ['score', 'final_score', 'population', 'n_pharmacies', 'pharm_per_10k']:
+            if col in top10.columns:
+                display_cols.append(col)
+        display_cols = [c for c in display_cols if c in top10.columns]
+        
+        if display_cols:
+            st.dataframe(top10[display_cols], use_container_width=True)
         return
 
     try:

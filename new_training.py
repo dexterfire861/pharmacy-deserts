@@ -35,7 +35,66 @@ try:
 except Exception:
     def tqdm(x, **kw): return x
 
-# === CONFIG ===
+import json
+import os
+
+# =============================================================================
+# TRAINING CONFIG LOADING
+# =============================================================================
+# The training orchestrator sets TRAINING_CONFIG env var pointing to a JSON config.
+# If set, we load the merged training data from there instead of individual files.
+#
+# Config JSON format:
+# {
+#   "dataset_id": "pharmacy_data",
+#   "dataset_version": "20260129_172450", 
+#   "data_file": "/path/to/merged_training_data.csv",
+#   "output_dir": "/path/to/results",
+#   "feature_columns": ["population", "median_income", ...],
+#   "zcta_column": "zcta5",
+#   "geo_columns": ["latitude", "longitude"]
+# }
+#
+# When TRAINING_CONFIG is set:
+#   - Load pre-merged data from data_file (already joined on ZCTA)
+#   - Output results to output_dir
+#   - Write metrics.json with training metrics
+#
+# ML Partner TODO:
+#   1. Adapt the data loading section to use MERGED_TRAINING_DATA if available
+#   2. Write metrics to TRAINING_OUTPUT/metrics.json
+#   3. Ensure all CSV outputs go to TRAINING_OUTPUT directory
+
+TRAINING_CONFIG_PATH = os.environ.get("TRAINING_CONFIG")
+MERGED_TRAINING_DATA = os.environ.get("TRAINING_DATA")
+TRAINING_OUTPUT = os.environ.get("TRAINING_OUTPUT")
+
+def load_training_config():
+    """Load training config from JSON if TRAINING_CONFIG is set."""
+    if TRAINING_CONFIG_PATH and Path(TRAINING_CONFIG_PATH).exists():
+        with open(TRAINING_CONFIG_PATH) as f:
+            return json.load(f)
+    return None
+
+def save_training_metrics(metrics: dict):
+    """Save training metrics to JSON in the output directory."""
+    if TRAINING_OUTPUT:
+        metrics_path = Path(TRAINING_OUTPUT) / "metrics.json"
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"[METRICS] Saved to {metrics_path}")
+
+# Load config if available
+_TRAINING_CONFIG = load_training_config()
+if _TRAINING_CONFIG:
+    print(f"[CONFIG] Using training config from: {TRAINING_CONFIG_PATH}")
+    print(f"[CONFIG] Dataset: {_TRAINING_CONFIG.get('dataset_id')} v{_TRAINING_CONFIG.get('dataset_version')}")
+    print(f"[CONFIG] Data file: {_TRAINING_CONFIG.get('data_file')}")
+    print(f"[CONFIG] Output dir: {_TRAINING_CONFIG.get('output_dir')}")
+
+# =============================================================================
+# === DEFAULT CONFIG (used when TRAINING_CONFIG is not set) ===
+# =============================================================================
 FINANCIAL_CSV  = "data/financial_data.csv"      # needs: ZCTA/ZIP + S1901_C01_012E
 HEALTH_CSV     = "data/health_data.csv"         # needs: ZCTA5, GHLTH_CrudePrev
 PHARMACY_CSV   = "data/pharmacy_data.csv"       # needs: ZIP, NAME; optional STATE/COUNTY and lon/lat columns
@@ -48,7 +107,8 @@ HHI_XLSX       = "data/HHI_data.xlsx"           # needs: ZCTA, HHB_SCORE
 # Prefer STATE over COUNTY for grouping
 REGION_PRIORITY = ["STATE","state","STATEFP","statefp","county","COUNTY","county_fips"]
 
-OUT_DIR        = "results"
+# Output directory - use TRAINING_OUTPUT if set, otherwise default to "results"
+OUT_DIR = TRAINING_OUTPUT if TRAINING_OUTPUT else "results"
 TOP_K          = 10
 MIN_POP_TOPK   = 1000
 
