@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Clear Streamlit cache to force reload of new pharmacy data
 """

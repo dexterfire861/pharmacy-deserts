@@ -5,6 +5,7 @@ These functions ensure heavy data loading only happens once per session
 and only when needed for the selected scoring mode.
 
 Supports both local filesystem (development) and S3 (production) data sources.
+Also supports loading from dataset configurations when ACTIVE_DATASET_ID is set.
 """
 import streamlit as st
 import pandas as pd
@@ -12,6 +13,9 @@ import numpy as np
 from pathlib import Path
 import sys
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to sys.path for imports
 parent_dir = Path(__file__).parent.parent.absolute()
@@ -26,6 +30,35 @@ from data.loaders import (
     downscale_county_to_zip, load_all_pharmacist_data
 )
 from data.features import preprocess
+
+
+def get_active_dataset_id() -> str:
+    """
+    Get the active dataset ID from environment or session state.
+    
+    Checks in order:
+    1. Streamlit session state (for UI-selected datasets)
+    2. ACTIVE_DATASET_ID environment variable
+    
+    Returns:
+        Dataset ID or empty string if none set
+    """
+    # Check session state first (allows UI override)
+    if 'active_dataset_id' in st.session_state and st.session_state.active_dataset_id:
+        return st.session_state.active_dataset_id
+    
+    # Fall back to environment variable
+    return os.getenv('ACTIVE_DATASET_ID', '')
+
+
+def set_active_dataset_id(dataset_id: str):
+    """Set the active dataset ID in session state."""
+    st.session_state.active_dataset_id = dataset_id
+
+
+def is_using_dataset_config() -> bool:
+    """Check if we should load from dataset config instead of default files."""
+    return bool(get_active_dataset_id())
 
 
 def _get_data_path(relative_path: str) -> str:
@@ -323,34 +356,42 @@ def load_latlon_lookup():
     Much lighter than loading the full math dataset bundle.
     
     Returns:
-        DataFrame with columns: zip, lat, lon
+        DataFrame with columns: zip, lat, lon (empty if file not found)
     """
     config = get_config()
     
-    if _is_s3_environment():
-        from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
-        import io
+    try:
+        if _is_s3_environment():
+            from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
+            import io
+            
+            s3_path = config.get_population_data_path()
+            bucket, key = parse_s3_path(s3_path)
+            data = download_s3_file_to_memory(bucket, key)
+            df = pd.read_csv(io.BytesIO(data), skiprows=10)
+        else:
+            population_path = Path('raw_data/population_data.csv')
+            if not population_path.exists():
+                logger.warning(f"Population data file not found: {population_path}")
+                return pd.DataFrame(columns=["zip", "lat", "lon"])
+            df = pd.read_csv(population_path, skiprows=10)
         
-        s3_path = config.get_population_data_path()
-        bucket, key = parse_s3_path(s3_path)
-        data = download_s3_file_to_memory(bucket, key)
-        df = pd.read_csv(io.BytesIO(data), skiprows=10)
-    else:
-        df = pd.read_csv('raw_data/population_data.csv', skiprows=10)
-    
-    df.columns = [str(c).strip() for c in df.columns]
-    lower = {c.lower(): c for c in df.columns}
-    
-    if not all(k in lower for k in ["zip", "lat", "long"]):
+        df.columns = [str(c).strip() for c in df.columns]
+        lower = {c.lower(): c for c in df.columns}
+        
+        if not all(k in lower for k in ["zip", "lat", "long"]):
+            return pd.DataFrame(columns=["zip", "lat", "lon"])
+        
+        out = pd.DataFrame({
+            "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+            "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
+            "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
+        })
+        
+        return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+    except Exception as e:
+        logger.warning(f"Failed to load lat/lon lookup: {e}")
         return pd.DataFrame(columns=["zip", "lat", "lon"])
-    
-    out = pd.DataFrame({
-        "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
-        "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
-        "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
-    })
-    
-    return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
 
 
 @st.cache_data(show_spinner="Loading pharmacist data...")
@@ -360,21 +401,29 @@ def load_pharmacist_data_only():
     Lighter than loading the full math dataset bundle.
     
     Returns:
-        DataFrame with pharmacist data
+        DataFrame with pharmacist data (empty if not found)
     """
     config = get_config()
     
-    if _is_s3_environment():
-        from data.s3_loaders import parse_s3_path, download_s3_directory
-        import tempfile
-        
-        s3_path = config.get_data_path(config.data_dir)
-        bucket, key = parse_s3_path(s3_path)
-        temp_dir = tempfile.mkdtemp(prefix='pharmacist_data_')
-        local_path = download_s3_directory(bucket, key.rstrip('/') + '/', temp_dir)
-        return load_all_pharmacist_data(local_path)
-    else:
-        return load_all_pharmacist_data('raw_data')
+    try:
+        if _is_s3_environment():
+            from data.s3_loaders import parse_s3_path, download_s3_directory
+            import tempfile
+            
+            s3_path = config.get_data_path(config.data_dir)
+            bucket, key = parse_s3_path(s3_path)
+            temp_dir = tempfile.mkdtemp(prefix='pharmacist_data_')
+            local_path = download_s3_directory(bucket, key.rstrip('/') + '/', temp_dir)
+            return load_all_pharmacist_data(local_path)
+        else:
+            raw_data_path = Path('raw_data')
+            if not raw_data_path.exists():
+                logger.warning(f"Raw data directory not found: {raw_data_path}")
+                return pd.DataFrame(columns=['Short_ZIP'])
+            return load_all_pharmacist_data('raw_data')
+    except Exception as e:
+        logger.warning(f"Failed to load pharmacist data: {e}")
+        return pd.DataFrame(columns=['Short_ZIP'])
 
 
 def get_glm_model_info():
@@ -405,3 +454,149 @@ def get_glm_model_info():
             last_modified = datetime.fromtimestamp(ai_file_path.stat().st_mtime)
             return True, last_modified
         return False, None
+
+
+# =============================================================================
+# DATASET CONFIG-BASED LOADING
+# =============================================================================
+
+@st.cache_data(show_spinner="Loading dataset from configuration...")
+def load_dataset_from_config_cached(dataset_id: str, version_id: str = None):
+    """
+    Load a dataset from its configuration file (cached).
+    
+    This function:
+    1. Reads LATEST.json to get the current version (if version_id not specified)
+    2. Reads dataset_config.json for the version
+    3. Loads each source file and applies its mapping
+    4. Merges all sources on 'zcta5' with appropriate suffixes
+    5. Returns the scoring config if available
+    
+    Args:
+        dataset_id: Dataset identifier
+        version_id: Specific version to load (uses LATEST if not specified)
+    
+    Returns:
+        Tuple of (DataFrame, ScoringConfig dict or None)
+    """
+    from ingestion.dataset_loader import load_dataset_from_config as _load_from_config
+    from ingestion.dataset_loader import get_scoring_config_from_dataset
+    
+    logger.info(f"Loading dataset from config: {dataset_id}")
+    
+    # Load the dataset
+    df = _load_from_config(dataset_id, version_id=version_id)
+    
+    # Standardize column name from zcta5 to zip for compatibility
+    if 'zcta5' in df.columns and 'zip' not in df.columns:
+        df = df.rename(columns={'zcta5': 'zip'})
+    
+    # Get scoring config
+    scoring_config = get_scoring_config_from_dataset(dataset_id, version_id)
+    
+    # Convert to dict for caching (ScoringConfig objects can't be cached)
+    scoring_config_dict = scoring_config.to_dict() if scoring_config else None
+    
+    return df, scoring_config_dict
+
+
+@st.cache_data(show_spinner="Loading smart dataset bundle...")
+def load_smart_dataset_bundle(active_dataset_id: str = ""):
+    """
+    Smart dataset loader that loads from dataset config if ID provided.
+    
+    Args:
+        active_dataset_id: Dataset ID to load (empty string for default)
+    
+    Returns:
+        tuple: (merged_df, pharmacist_data, scoring_config_dict or None)
+    """
+    if active_dataset_id:
+        logger.info(f"Loading from dataset config: {active_dataset_id}")
+        
+        try:
+            # Load the configured dataset with scoring config
+            df, scoring_config_dict = load_dataset_from_config_cached(active_dataset_id)
+            
+            # Still need pharmacist data from default source
+            pharmacist_data = load_pharmacist_data_only()
+            
+            return df, pharmacist_data, scoring_config_dict
+        except (ValueError, FileNotFoundError) as e:
+            # Dataset doesn't exist yet - return empty
+            logger.warning(f"Dataset '{active_dataset_id}' not found: {e}")
+            from models.schema import get_default_scoring_config
+            empty_df = pd.DataFrame(columns=['zip', 'zcta5'])
+            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
+            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
+    else:
+        # Fall back to default loading (returns default scoring config)
+        # But first check if default files exist
+        if not Path('raw_data/financial_data.csv').exists():
+            # No default data available - return empty with default config
+            logger.warning("No default raw_data files found and no dataset selected")
+            from models.schema import get_default_scoring_config
+            empty_df = pd.DataFrame(columns=['zip'])
+            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
+            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
+        
+        df, pharmacist_data = load_math_dataset_bundle()
+        
+        # Get default scoring config
+        from models.schema import get_default_scoring_config
+        default_config = get_default_scoring_config()
+        
+        return df, pharmacist_data, default_config.to_dict()
+
+
+def get_scoring_config_object(scoring_config_dict):
+    """
+    Convert a scoring config dict back to a ScoringConfig object.
+    
+    Args:
+        scoring_config_dict: Dictionary from cached load
+    
+    Returns:
+        ScoringConfig object or default config if None
+    """
+    from models.schema import ScoringConfig, get_default_scoring_config
+    
+    if scoring_config_dict is None:
+        return get_default_scoring_config()
+    
+    return ScoringConfig.from_dict(scoring_config_dict)
+
+
+def get_available_datasets():
+    """
+    Get list of available datasets from storage.
+    
+    Returns:
+        List of dataset info dictionaries
+    """
+    from ingestion.dataset_loader import list_available_datasets
+    
+    try:
+        return list_available_datasets()
+    except Exception as e:
+        logger.warning(f"Failed to list datasets: {e}")
+        return []
+
+
+def get_dataset_details(dataset_id: str):
+    """
+    Get detailed info about a specific dataset.
+    
+    Args:
+        dataset_id: Dataset identifier
+    
+    Returns:
+        Dictionary with dataset details
+    """
+    from ingestion.dataset_loader import get_dataset_info
+    
+    try:
+        return get_dataset_info(dataset_id)
+    except Exception as e:
+        logger.warning(f"Failed to get dataset info: {e}")
+        return None
