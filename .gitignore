@@ -50,8 +50,8 @@ ENV/
 # Streamlit
 .streamlit/
 
-# Local data directories (keep structure but not actual data)
-raw_data/datasets/*/versions/*/files/
+# Local data directories - users upload their own data through the app
+raw_data/
 temp_uploads/
 
 # Large data files
