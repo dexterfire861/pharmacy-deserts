@@ -1,0 +1,94 @@
+{
+  "sliders": [
+    {
+      "id": "w_rx_demand",
+      "label": "Rx Demand Intensity",
+      "pillar": "revenue",
+      "description": "Weight for chronic disease prescription burden",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "w_payer_quality",
+      "label": "Payer Quality",
+      "pillar": "revenue",
+      "description": "Weight for insurance reimbursement quality",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.3
+    },
+    {
+      "id": "w_market_size",
+      "label": "Market Size",
+      "pillar": "revenue",
+      "description": "Weight for population and density",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.5
+    },
+    {
+      "id": "w_med_usage",
+      "label": "Medication Usage",
+      "pillar": "revenue",
+      "description": "Weight for direct medication utilization signals",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "w_occupancy_cost",
+      "label": "Occupancy Cost",
+      "pillar": "cost",
+      "description": "Weight for rent/real estate cost pressure",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "w_labor_cost",
+      "label": "Labor Cost",
+      "pillar": "cost",
+      "description": "Weight for state-level pharmacy labor costs",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "w_competition",
+      "label": "Competition Penalty",
+      "pillar": "capture",
+      "description": "Weight for competitive saturation effect",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "w_market_opportunity",
+      "label": "Market Opportunity",
+      "pillar": "capture",
+      "description": "Weight for pharmacy scarcity bonus",
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1,
+      "default": 1.0
+    },
+    {
+      "id": "alpha_revenue_vs_cost",
+      "label": "Revenue vs Cost Balance",
+      "pillar": "master",
+      "description": "Higher = prioritize revenue potential over cost avoidance",
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05,
+      "default": 0.65
+    }
+  ]
+}

@@ -342,7 +342,7 @@ def _load_revenue_presets() -> pd.DataFrame:
     return empty
 
 
-def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None):
+def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None, map_key: str = "pharmacy_map"):
     """
     Render an interactive map of top pharmacy desert ZIPs.
     Note: Returns HTML, so parent should handle display to avoid reruns on interaction.
@@ -695,14 +695,17 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None):
                 ),
                 max_width=popup_width + 20
             )
+            score_val = float(r.get("final_score", 0) or 0)
+            # Keep markers comfortably clickable even in low-score/worst views.
+            marker_radius = max(11, min(20, 11 + 9 * score_val))
             folium.CircleMarker(
                 location=[lat, lon],
-                radius=max(5, min(20, 5 + 15*float(r.get("final_score", 0)))),
+                radius=marker_radius,
                 color=None, fill=True, fill_opacity=0.7, popup=popup
             ).add_to(fmap)
 
         # Use key to prevent reruns on map interaction
-        st_folium(fmap, width=None, key="pharmacy_map", returned_objects=[])
+        st_folium(fmap, width=None, key=map_key, returned_objects=[])
     except ModuleNotFoundError:
         st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
         # Create a clean DataFrame with just lat/lon for st.map()

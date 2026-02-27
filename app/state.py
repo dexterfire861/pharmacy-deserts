@@ -15,6 +15,7 @@ import sys
 import os
 import io
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ def _is_s3_environment() -> bool:
 @st.cache_data(show_spinner="Loading math model datasets...")
 def load_math_dataset_bundle():
     """
-    Load and merge all datasets needed for Math and Blended scoring modes.
+    Load and merge all datasets needed for Math scoring mode.
     
     Automatically loads from S3 in production or local filesystem in development.
     
@@ -346,6 +347,153 @@ def load_glm_results():
         ranked['pharmacies_count'] / ranked['population'].clip(lower=1)
     ) * 10000
     
+    return ranked
+
+
+def _resolve_first_existing_path(candidates: list[str]) -> Optional[Path]:
+    """Return the first existing path from an ordered candidate list."""
+    for candidate in candidates:
+        p = Path(candidate)
+        if p.exists():
+            return p
+    return None
+
+
+@st.cache_data(show_spinner="Loading Profit Model v2 results...")
+def load_profit_model_v2_results():
+    """
+    Load Part 2 Walgreens Profit Model outputs and standardize for app display.
+
+    Expected output file:
+      - results_v2/profit_scores.csv
+
+    Returns:
+        DataFrame compatible with app ranking views (zip, final_score, etc.).
+    """
+    path = _resolve_first_existing_path(
+        [
+            "results_v2/profit_scores.csv",
+            "deployment/walgreens_portfolio/results_v2/profit_scores.csv",
+        ]
+    )
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        ranked = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str, "zip": str})
+    except Exception as e:
+        logger.warning(f"Failed loading Profit Model v2 results from {path}: {e}")
+        return pd.DataFrame()
+
+    zip_col = next(
+        (c for c in ["zip", "ZCTA5", "zcta5", "ZIP", "Zip"] if c in ranked.columns),
+        None,
+    )
+    if not zip_col:
+        logger.warning("Profit Model v2 output missing ZIP/ZCTA column.")
+        return pd.DataFrame()
+
+    ranked["zip"] = ranked[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    ranked = ranked.dropna(subset=["zip"]).copy()
+
+    score_col = "profit_score" if "profit_score" in ranked.columns else None
+    if not score_col:
+        logger.warning("Profit Model v2 output missing 'profit_score'.")
+        return pd.DataFrame()
+
+    ranked[score_col] = pd.to_numeric(ranked[score_col], errors="coerce")
+    ranked = ranked.dropna(subset=[score_col]).copy()
+    ranked["score"] = ranked[score_col]
+    ranked["final_score"] = ranked[score_col]
+    ranked["ai_score"] = np.nan
+
+    if "pharmacies_count" in ranked.columns and "n_pharmacies" not in ranked.columns:
+        ranked["n_pharmacies"] = pd.to_numeric(ranked["pharmacies_count"], errors="coerce")
+
+    if "is_pharmacy_desert" in ranked.columns:
+        ranked["desert_flag"] = (
+            pd.to_numeric(ranked["is_pharmacy_desert"], errors="coerce").fillna(0).astype(int)
+        )
+    elif "n_pharmacies" in ranked.columns:
+        ranked["desert_flag"] = (
+            pd.to_numeric(ranked["n_pharmacies"], errors="coerce").fillna(0).eq(0).astype(int)
+        )
+    else:
+        ranked["desert_flag"] = 0
+
+    if "lat" in ranked.columns:
+        ranked["lat"] = pd.to_numeric(ranked["lat"], errors="coerce")
+    if "lon" in ranked.columns:
+        ranked["lon"] = pd.to_numeric(ranked["lon"], errors="coerce")
+
+    ranked["model_source"] = "profit_model_v2"
+    ranked = ranked.sort_values("final_score", ascending=False, na_position="last").reset_index(drop=True)
+    return ranked
+
+
+@st.cache_data(show_spinner="Loading Walgreens Optimizer results...")
+def load_walgreens_optimizer_results():
+    """
+    Load Part 3 Walgreens optimizer outputs and standardize for app display.
+
+    Expected output file:
+      - results_walgreens/store_viability_scores.csv
+
+    Returns:
+        DataFrame compatible with app ranking views (zip, final_score, etc.).
+    """
+    path = _resolve_first_existing_path(
+        [
+            "results_walgreens/store_viability_scores.csv",
+            "deployment/walgreens_portfolio/results_walgreens/store_viability_scores.csv",
+        ]
+    )
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        stores = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str, "zip": str})
+    except Exception as e:
+        logger.warning(f"Failed loading Walgreens Optimizer results from {path}: {e}")
+        return pd.DataFrame()
+
+    zip_col = next(
+        (c for c in ["zip", "ZCTA5", "zcta5", "ZIP", "Zip"] if c in stores.columns),
+        None,
+    )
+    if not zip_col:
+        logger.warning("Walgreens optimizer output missing ZIP/ZCTA column.")
+        return pd.DataFrame()
+    if "store_viability" not in stores.columns:
+        logger.warning("Walgreens optimizer output missing 'store_viability'.")
+        return pd.DataFrame()
+
+    stores["zip"] = stores[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    stores["store_viability"] = pd.to_numeric(stores["store_viability"], errors="coerce")
+    stores = stores.dropna(subset=["zip", "store_viability"]).copy()
+
+    # If store-level rows exist, keep the top-viability store per ZIP for map/ranking.
+    ranked = (
+        stores.sort_values("store_viability", ascending=False)
+        .drop_duplicates(subset=["zip"], keep="first")
+        .copy()
+    )
+
+    ranked["score"] = ranked["store_viability"]
+    ranked["final_score"] = ranked["store_viability"]
+    ranked["ai_score"] = np.nan
+    ranked["desert_flag"] = 0
+
+    if "total_pharmacies" in ranked.columns and "n_pharmacies" not in ranked.columns:
+        ranked["n_pharmacies"] = pd.to_numeric(ranked["total_pharmacies"], errors="coerce")
+
+    if "lat" in ranked.columns:
+        ranked["lat"] = pd.to_numeric(ranked["lat"], errors="coerce")
+    if "lon" in ranked.columns:
+        ranked["lon"] = pd.to_numeric(ranked["lon"], errors="coerce")
+
+    ranked["model_source"] = "walgreens_optimizer_v2"
+    ranked = ranked.sort_values("final_score", ascending=False, na_position="last").reset_index(drop=True)
     return ranked
 
 

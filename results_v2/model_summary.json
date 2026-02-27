@@ -1,0 +1,46 @@
+{
+  "run_timestamp": "2026-02-27T03:54:12.842827",
+  "total_zctas": 37231,
+  "scoreable_zctas": 30224,
+  "pharmacy_deserts": 13941,
+  "avg_profit_score": 0.3679037116219595,
+  "median_profit_score": 0.32762437610773143,
+  "tier_distribution": {
+    "Moderate": 16344,
+    "Low": 16117,
+    "Strong": 4303,
+    "Premium": 467
+  },
+  "avg_revenue_potential": 0.4722349057983342,
+  "avg_cost_pressure": 0.25000671483441217,
+  "avg_capture_rate": 0.3760976073593622,
+  "weights_used": {
+    "w_rx_demand": 1.0,
+    "w_payer_quality": 1.3,
+    "w_market_size": 1.5,
+    "w_med_usage": 1.0,
+    "w_occupancy_cost": 1.0,
+    "w_labor_cost": 1.0,
+    "w_competition": 1.0,
+    "w_market_opportunity": 1.0,
+    "alpha_revenue_vs_cost": 0.65
+  },
+  "data_coverage": {
+    "financial": 37231,
+    "health": 32057,
+    "insurance": 32496,
+    "home_price": 37231,
+    "pharmacy": 16483,
+    "density": 37102
+  },
+  "chronic_disease_cols_used": [
+    "DIABETES_CrudePrev",
+    "BPHIGH_CrudePrev",
+    "HIGHCHOL_CrudePrev",
+    "COPD_CrudePrev",
+    "ARTHRITIS_CrudePrev",
+    "CASTHMA_CrudePrev",
+    "DEPRESSION_CrudePrev",
+    "OBESITY_CrudePrev"
+  ]
+}

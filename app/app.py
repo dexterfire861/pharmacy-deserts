@@ -4,7 +4,9 @@ Pharmacy Desert Explorer - Streamlit Application
 
 This app provides fast startup by only loading data needed for the selected mode:
 - GLM Only: Loads pre-computed GLM results (fast, no network calls)
-- Math Only / Blended: Loads full dataset bundle (slower, includes ACS API call)
+- Profit Model v2: Loads Walgreens Part 2 ZCTA outputs (if available)
+- Walgreens Optimizer v2: Loads Walgreens Part 3 store/ZCTA outputs (if available)
+- Math Only: Loads full dataset bundle (slower, includes ACS API call)
 
 Supports flexible scoring configurations from uploaded datasets.
 """
@@ -25,6 +27,8 @@ from app.state import (
     load_math_dataset_bundle,
     load_smart_dataset_bundle,
     load_glm_results,
+    load_profit_model_v2_results,
+    load_walgreens_optimizer_results,
     load_latlon_lookup,
     load_pharmacist_data_only,
     load_pharmacy_data_only,
@@ -38,14 +42,13 @@ from app.state import (
 from app.auth import login_form, logout_button, is_authenticated
 from app.config import get_config
 from models.scoring import (
-    score_candidates, score_with_config, score_with_features, average_scores,
+    score_candidates, score_with_config, score_with_features,
     get_available_weights_for_dataset, get_available_features_for_weighting
 )
 from models.schema import (
     ScoringConfig, SCORING_COMPONENTS, COMPONENT_CATEGORIES,
     get_default_scoring_config, ScoreDirection
 )
-from models.ai_scores import read_ifae_csv
 from viz.map_viz import render_top10_map
 
 
@@ -350,9 +353,12 @@ def main():
     # =========================================================================
     st.title("Pharmacy Desert Explorer")
     st.markdown("""
-    ### Hybrid GLM + Mathematical Approach
-    1) **Math model** (weighted, adjustable)  •  2) **GLM+Hybrid model** (Poisson GLM + GBDT/XGBoost residuals)  
-    **Final Ranking** blends both for robust, research-grade results.
+    ### Multi-Model Decision Platform
+    Compare ranked ZIP outputs across:
+    1) **Math model** (weighted, adjustable)
+    2) **GLM model** (pre-trained)
+    3) **Profit Model v2** (Walgreens Part 2)
+    4) **Walgreens Optimizer v2** (Walgreens Part 3)
     """)
     st.divider()
 
@@ -456,9 +462,14 @@ def main():
     st.sidebar.header("Scoring Mode")
     scoring_mode = st.sidebar.radio(
         "Choose ranking method:", 
-        ["GLM Only", "Blended (Math + GLM)", "Math Only"], 
+        ["GLM Only", "Profit Model v2", "Walgreens Optimizer v2", "Math Only"], 
         index=0,
-        help="GLM Only: Fast startup, pure ML model | Blended: 50% Math + 50% GLM | Math Only: Full dataset + adjustable weights"
+        help=(
+            "GLM Only: Pretrained model results | "
+            "Profit Model v2: Walgreens Part 2 ZCTA profit scores | "
+            "Walgreens Optimizer v2: Walgreens Part 3 viability/actions | "
+            "Math Only: Full dataset + adjustable weighted equation"
+        )
     )
     st.sidebar.divider()
 
@@ -467,16 +478,131 @@ def main():
     if st.sidebar.button("🔄 Refresh Data", help="Clear cache and reload all data"):
         st.cache_data.clear()
         st.rerun()
+
+    with st.sidebar.expander("🏪 Walgreens Pipeline", expanded=False):
+        st.caption("Generate `results_v2` and `results_walgreens` outputs used by Walgreens modes.")
+        default_npi_path = ""
+
+        # Prefer canonical deployment input if present.
+        canonical_npi = Path("data/pharmacy_data.csv")
+        if canonical_npi.exists():
+            default_npi_path = str(canonical_npi)
+
+        try:
+            import json as _json
+
+            if not default_npi_path:
+                latest_path = Path("raw_data/datasets/pharmacy_data/LATEST.json")
+                if latest_path.exists():
+                    latest_version = _json.loads(latest_path.read_text()).get("latest_version")
+                    if latest_version:
+                        cfg_path = Path(f"raw_data/datasets/pharmacy_data/versions/{latest_version}/dataset_config.json")
+                        if cfg_path.exists():
+                            cfg = _json.loads(cfg_path.read_text())
+                            pharmacy_fname = (cfg.get("uploaded_files") or {}).get("pharmacy")
+                            if pharmacy_fname:
+                                candidate = Path(f"raw_data/datasets/pharmacy_data/versions/{latest_version}/files/{pharmacy_fname}")
+                                if candidate.exists():
+                                    default_npi_path = str(candidate)
+        except Exception:
+            default_npi_path = ""
+
+        if not default_npi_path:
+            fallback_candidates = [
+                "data/pharmacy_data.csv",
+                "raw_data/pharmacy_data.csv",
+                "raw_data/npi_cache/pharmacies.csv.gz",
+            ]
+            default_npi_path = next((p for p in fallback_candidates if Path(p).exists()), "data/pharmacy_data.csv")
+        npi_input_path = st.text_input(
+            "NPI / pharmacy input path",
+            value=default_npi_path,
+            key="walgreens_npi_input_path",
+            help="Path to pharmacy input file (CSV or Excel) used by Walgreens deployment scripts.",
+        )
+        walgreens_only_run = st.checkbox(
+            "Walgreens-only (skip Part 2)",
+            value=False,
+            key="walgreens_only_run",
+            help="Requires existing `results_v2/profit_scores.csv`.",
+        )
+        walgreens_skip_ml = st.checkbox(
+            "Skip ML layers (recommended local)",
+            value=True,
+            key="walgreens_skip_ml",
+            help=(
+                "Skips Part 2b ML enhancement and Walgreens XGBoost layer. "
+                "Use this if local OpenMP/XGBoost runtime fails."
+            ),
+        )
+        if st.button("Run Walgreens Pipeline", key="run_walgreens_pipeline_btn"):
+            import subprocess
+            runner_python = str(Path("venv/bin/python")) if Path("venv/bin/python").exists() else sys.executable
+            cmd = [
+                runner_python,
+                "deployment/walgreens_portfolio/run_complete_system.py",
+                "--npi",
+                npi_input_path,
+            ]
+            if walgreens_only_run:
+                cmd.append("--walgreens-only")
+            if walgreens_skip_ml:
+                cmd.append("--skip-ml")
+            with st.spinner("Running Walgreens pipeline..."):
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+
+            stdout_tail = "\n".join(proc.stdout.splitlines()[-30:]) if proc.stdout else ""
+            stderr_tail = "\n".join(proc.stderr.splitlines()[-30:]) if proc.stderr else ""
+            if proc.returncode == 0:
+                st.success("Walgreens pipeline completed.")
+                if stdout_tail:
+                    st.code(stdout_tail)
+                st.cache_data.clear()
+            else:
+                st.error(f"Walgreens pipeline failed (exit code {proc.returncode}).")
+                if stderr_tail:
+                    st.code(stderr_tail)
+                elif stdout_tail:
+                    st.code(stdout_tail)
     
     # Show logout button if authenticated
     logout_button()
     
     if scoring_mode == "GLM Only":
-        st.sidebar.caption("💡 GLM Only mode: Fast startup, no network calls")
-        st.sidebar.caption("Uploaded custom feature columns are viewable in Math/Blended mode.")
+        st.sidebar.caption("💡 GLM mode: Fast startup, uses existing trained model outputs.")
+    elif scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"}:
+        st.sidebar.caption("💡 Walgreens modes: Load pipeline outputs from local CSV files.")
     else:
-        st.sidebar.caption("⚠️ Math/Blended mode: Loads full dataset (slower, uses Census API)")
+        st.sidebar.caption("⚠️ Math mode: Loads full uploaded dataset and applies sliders.")
     st.sidebar.divider()
+
+    def _attach_latlon_if_missing(ranked_df: pd.DataFrame) -> pd.DataFrame:
+        """Attach lat/lon by ZIP if the selected model output doesn't include it."""
+        if ranked_df is None or ranked_df.empty:
+            return ranked_df
+        if "lat" in ranked_df.columns and ranked_df["lat"].notna().any():
+            return ranked_df
+
+        latlon_df = load_latlon_lookup()
+        if latlon_df.empty:
+            # Direct fallback: read lat/lon from latest unified dataset on disk.
+            try:
+                import json as _json
+                _latest_path = Path("raw_data/datasets/pharmacy_data/LATEST.json")
+                if _latest_path.exists():
+                    _ver = _json.loads(_latest_path.read_text()).get("latest_version")
+                    if _ver:
+                        _upath = Path(f"raw_data/datasets/pharmacy_data/versions/{_ver}/unified_dataset.csv")
+                        if _upath.exists():
+                            latlon_df = pd.read_csv(_upath, dtype={"zip": str}, usecols=["zip", "lat", "lon"])
+                            latlon_df["zip"] = latlon_df["zip"].astype(str).str.zfill(5)
+                            latlon_df = latlon_df.dropna(subset=["lat", "lon"]).drop_duplicates(subset=["zip"])
+            except Exception:
+                pass
+
+        if latlon_df.empty:
+            return ranked_df
+        return ranked_df.merge(latlon_df[["zip", "lat", "lon"]], on="zip", how="left")
 
     # =========================================================================
     # CONDITIONAL DATA LOADING
@@ -492,99 +618,127 @@ def main():
             **To use GLM mode, you need to:**
             1. Upload data via the **Upload Data** page
             2. Train a model (run the training pipeline after upload)
-            
-            **Or switch to Math/Blended mode** which works with uploaded data directly.
+
+            Or switch to **Math Only** mode, which works with uploaded data directly.
             """)
             if st.button("📤 Go to Upload Data Page", type="primary"):
                 st.switch_page("pages/Upload_Data.py")
             st.stop()
-        
-        # Load GLM results (cached)
+
         ranked = load_glm_results()
-        
         if ranked.empty:
             st.error("Failed to load GLM results.")
             st.stop()
-        
-        # Merge lat/lon from the unified dataset if not present in GLM results
-        if 'lat' not in ranked.columns or ranked['lat'].isna().all():
-            latlon_df = load_latlon_lookup()
-            if latlon_df.empty:
-                # Direct fallback: read lat/lon from unified dataset on disk
-                try:
-                    import json as _json
-                    _latest_path = Path('raw_data/datasets/pharmacy_data/LATEST.json')
-                    if _latest_path.exists():
-                        _ver = _json.loads(_latest_path.read_text()).get('latest_version')
-                        if _ver:
-                            _upath = Path(f'raw_data/datasets/pharmacy_data/versions/{_ver}/unified_dataset.csv')
-                            if _upath.exists():
-                                latlon_df = pd.read_csv(_upath, dtype={'zip': str}, usecols=['zip', 'lat', 'lon'])
-                                latlon_df['zip'] = latlon_df['zip'].astype(str).str.zfill(5)
-                                latlon_df = latlon_df.dropna(subset=['lat', 'lon']).drop_duplicates(subset=['zip'])
-                except Exception:
-                    pass
-            if not latlon_df.empty:
-                ranked = ranked.merge(latlon_df[['zip', 'lat', 'lon']], on='zip', how='left')
-        
-        # Load pharmacist data (needed for map popups)
+
+        ranked = _attach_latlon_if_missing(ranked)
         pharmacist_data = load_pharmacist_data_only()
         pharmacy_detail_data = load_pharmacy_data_only()
-        
-        # Set up variables for GLM mode
-        df = None  # Not used in GLM Only mode
+
+        df = None
         scoring_config = None
-        sort_col = 'final_score'
-        
-        st.success(f"✅ GLM Model loaded - {len(ranked):,} ZIPs analyzed (fast mode)")
-        st.sidebar.success(f"✅ GLM Model (PURE) - {len(ranked):,} ZIPs")
-        st.info(
-            "GLM Only mode shows model-result columns. "
-            "To inspect uploaded custom dataset columns, switch to Math Only or Blended mode."
-        )
-        
-        # No weight sliders in GLM mode
+        sort_col = "final_score"
         weights = {}
         gate_goodrx = False
-        
+
+        st.success(f"✅ GLM Model loaded - {len(ranked):,} ZIPs analyzed")
+        st.sidebar.success(f"✅ GLM Model - {len(ranked):,} ZIPs")
+        st.info(
+            "GLM mode shows trained-model results. "
+            "Use Math mode to apply custom weighting sliders."
+        )
+
+    elif scoring_mode == "Profit Model v2":
+        # =====================================================================
+        # WALGREENS PART 2 MODE - Load precomputed ZCTA profit outputs
+        # =====================================================================
+        ranked = load_profit_model_v2_results()
+        if ranked.empty:
+            st.warning("⚠️ Profit Model v2 outputs not found.")
+            st.info(
+                "Run the Walgreens pipeline to generate `results_v2/profit_scores.csv`:\n\n"
+                "`python deployment/walgreens_portfolio/run_complete_system.py`\n"
+                "(auto-detects latest uploaded pharmacy file; pass `--npi <path>` to override)"
+            )
+            st.stop()
+
+        ranked = _attach_latlon_if_missing(ranked)
+        pharmacist_data = load_pharmacist_data_only()
+        pharmacy_detail_data = load_pharmacy_data_only()
+
+        df = None
+        scoring_config = None
+        sort_col = "final_score"
+        weights = {}
+        gate_goodrx = False
+
+        st.success(f"✅ Profit Model v2 loaded - {len(ranked):,} ZIPs scored")
+        st.sidebar.success(f"✅ Profit Model v2 - {len(ranked):,} ZIPs")
+
+    elif scoring_mode == "Walgreens Optimizer v2":
+        # =====================================================================
+        # WALGREENS PART 3 MODE - Load store viability/action outputs
+        # =====================================================================
+        ranked = load_walgreens_optimizer_results()
+        if ranked.empty:
+            st.warning("⚠️ Walgreens Optimizer outputs not found.")
+            st.info(
+                "Run the Walgreens pipeline to generate "
+                "`results_walgreens/store_viability_scores.csv`:\n\n"
+                "`python deployment/walgreens_portfolio/run_complete_system.py`\n"
+                "(auto-detects latest uploaded pharmacy file; pass `--npi <path>` to override)"
+            )
+            st.stop()
+
+        ranked = _attach_latlon_if_missing(ranked)
+        pharmacist_data = load_pharmacist_data_only()
+        pharmacy_detail_data = load_pharmacy_data_only()
+
+        df = None
+        scoring_config = None
+        sort_col = "final_score"
+        weights = {}
+        gate_goodrx = False
+
+        st.success(f"✅ Walgreens Optimizer v2 loaded - {len(ranked):,} ZIPs with Walgreens presence")
+        st.sidebar.success(f"✅ Walgreens Optimizer v2 - {len(ranked):,} ZIPs")
+        if "action" in ranked.columns and ranked["action"].notna().any():
+            action_counts = ranked["action"].value_counts().head(5)
+            st.caption(
+                "Action mix: "
+                + " | ".join([f"{action}: {count:,}" for action, count in action_counts.items()])
+            )
+
     else:
         # =====================================================================
-        # MATH / BLENDED MODE - Full dataset loading with flexible scoring
+        # MATH MODE - Full dataset loading with adjustable weighted equation
         # =====================================================================
-        
-        # Check if dataset exists before trying to load
         if not pharmacy_dataset:
             st.warning("⚠️ **No data uploaded yet**")
             st.info("""
-            **To use Math/Blended mode, you need to upload data first:**
-            
+            **To use Math mode, upload data first:**
+
             1. Go to the **Upload Data** page
             2. Upload your data files (CSV, Excel, etc.)
             3. Configure column mappings and scoring components
-            4. Return here to analyze the data
-            
-            The platform will automatically use your uploaded dataset.
+            4. Return here to analyze
             """)
             if st.button("📤 Go to Upload Data Page", type="primary"):
                 st.switch_page("pages/Upload_Data.py")
             st.stop()
-        
+
         try:
-            # Use smart loader that returns (df, pharmacist_data, scoring_config_dict)
-            # Pass the active dataset ID as argument for proper caching
             current_dataset_id = get_active_dataset_id()
             dataset_version_hint = pharmacy_dataset.get("version", "") if pharmacy_dataset else ""
             df, pharmacist_data, scoring_config_dict = load_smart_dataset_bundle(
                 current_dataset_id, dataset_version_hint
             )
             pharmacy_detail_data = load_pharmacy_data_only()
-            
-            # Check if dataset is empty
+
             if df.empty or len(df) == 0:
                 st.warning("⚠️ **Dataset is empty**")
                 st.info("""
                 The dataset exists but contains no data. Please:
-                
+
                 1. Go to the **Upload Data** page
                 2. Upload data files with ZIP/ZCTA codes
                 3. Configure the data mappings
@@ -593,13 +747,12 @@ def main():
                 if st.button("📤 Go to Upload Data Page", type="primary"):
                     st.switch_page("pages/Upload_Data.py")
                 st.stop()
-            
-            # Convert scoring config dict back to object
+
             scoring_config = get_scoring_config_object(scoring_config_dict)
             df, backfilled_inputs = align_dataset_to_main_scoring_columns(df, scoring_config)
-            
+
             pharm_count = len(pharmacist_data) if not pharmacist_data.empty else 0
-            unique_pharm_zips = pharmacist_data['Short_ZIP'].nunique() if not pharmacist_data.empty else 0
+            unique_pharm_zips = pharmacist_data["Short_ZIP"].nunique() if not pharmacist_data.empty else 0
             pharmacy_count = len(pharmacy_detail_data) if pharmacy_detail_data is not None and not pharmacy_detail_data.empty else 0
             unique_pharmacy_zips = (
                 pharmacy_detail_data["Short_ZIP"].nunique()
@@ -611,8 +764,7 @@ def main():
                 f"{pharm_count:,} pharmacist records from {unique_pharm_zips} ZIPs | "
                 f"{pharmacy_count:,} pharmacy records from {unique_pharmacy_zips} ZIPs"
             )
-            
-            # Show scoring config info
+
             if is_using_dataset_config():
                 mapped_count = len(scoring_config.column_mappings)
                 st.info(f"🎯 Using curated scoring mappings ({mapped_count} mapped components)")
@@ -620,13 +772,12 @@ def main():
                     st.caption(
                         f"Mapped {backfilled_inputs} column(s) into the app's fixed scoring inputs."
                     )
-                
+
         except (ValueError, FileNotFoundError) as e:
-            # Dataset doesn't exist or can't be loaded
             st.warning("⚠️ **Could not load dataset**")
             st.info(f"""
             **Error:** {str(e)}
-            
+
             **To fix this:**
             1. Go to the **Upload Data** page
             2. Upload your data files
@@ -676,7 +827,6 @@ def main():
             help="Denser areas with gaps = more affected people.",
         )
 
-        # Optional components — only show if data is present
         w_edu = 0.0
         if "edu_hs_or_lower_pct" in df.columns:
             w_edu = st.sidebar.slider(
@@ -701,8 +851,6 @@ def main():
                 help="Heat-health burden index (HHI).",
             )
 
-        # Automatically add uploaded custom numeric features as optional
-        # scoring inputs with their own sliders.
         extra_feature_defaults = (
             scoring_config.custom_feature_weights
             if scoring_config and hasattr(scoring_config, "custom_feature_weights")
@@ -720,7 +868,6 @@ def main():
             if col in df.columns and col not in core_scoring_columns and _is_numeric_feature_candidate(df[col]):
                 extra_feature_candidates.append(col)
 
-        # Fallback for older configs: auto-detect prefixed custom columns.
         for col in sorted(c for c in df.columns if "__" in c):
             if (
                 col not in core_scoring_columns
@@ -763,21 +910,17 @@ def main():
             weights[f"feature::{col}"] = weight
         st.sidebar.divider()
 
-        # Optional: GoodRx hard gate controls (only if those columns exist)
         if "zip_desert_share" in df.columns:
             st.sidebar.header("GoodRx Desert Gate")
             gate_goodrx = st.sidebar.checkbox(
-                "Hard gate to GoodRx-defined deserts", 
+                "Hard gate to GoodRx-defined deserts",
                 value=False,
                 help="When ON, only ZIPs that are GoodRx drive-time deserts are kept."
             )
             min_cov = st.sidebar.slider("Minimum crosswalk coverage (HUD)", 0.0, 1.0, 0.60, 0.05)
             thr_goodrx = st.sidebar.slider("Desert severity threshold", 0.0, 1.0, 0.50, 0.05)
-            
-            # Apply desert flag
             df["zip_desert_flag_user"] = (df["zip_desert_share"] >= thr_goodrx).astype("Int64")
-            
-            # Apply GoodRx gate
+
             if gate_goodrx:
                 flag_col = "zip_desert_flag_user" if "zip_desert_flag_user" in df.columns else "zip_desert_flag"
                 if flag_col not in df.columns:
@@ -795,38 +938,36 @@ def main():
         else:
             gate_goodrx = False
 
-        # Population/Urban filters (if columns exist)
-        if 'pop_density' in df.columns or 'population' in df.columns:
+        if "pop_density" in df.columns or "population" in df.columns:
             st.sidebar.header("🏙️ Target Area Filters")
             st.sidebar.markdown("*Focus on semi-urban communities:*")
 
             min_population = st.sidebar.slider(
                 "Minimum population", 0, 50000, 5000, 1000,
                 help="Exclude very small ZIPs"
-            ) if 'population' in df.columns else 0
-            
+            ) if "population" in df.columns else 0
+
             min_density = st.sidebar.slider(
                 "Minimum density (people/km²)", 0, 1000, 100, 50,
                 help="100-400 = semi-urban sweet spot"
-            ) if 'pop_density' in df.columns else 0
-            
+            ) if "pop_density" in df.columns else 0
+
             max_density = st.sidebar.slider(
                 "Maximum density (people/km²)", 0, 10000, 5000, 500,
                 help="Exclude extremely dense urban cores if desired. 0 = no max"
-            ) if 'pop_density' in df.columns else 0
+            ) if "pop_density" in df.columns else 0
 
-            # Apply filters
             filters_applied = []
             df_before_filters = len(df)
 
-            if min_population > 0 and 'population' in df.columns:
-                df = df[df['population'].fillna(0) >= min_population]
+            if min_population > 0 and "population" in df.columns:
+                df = df[df["population"].fillna(0) >= min_population]
                 filters_applied.append(f"pop ≥ {min_population:,}")
-            if min_density > 0 and 'pop_density' in df.columns:
-                df = df[df['pop_density'].fillna(0) >= min_density]
+            if min_density > 0 and "pop_density" in df.columns:
+                df = df[df["pop_density"].fillna(0) >= min_density]
                 filters_applied.append(f"density ≥ {min_density}")
-            if max_density > 0 and 'pop_density' in df.columns:
-                df = df[df['pop_density'].fillna(999999) <= max_density]
+            if max_density > 0 and "pop_density" in df.columns:
+                df = df[df["pop_density"].fillna(999999) <= max_density]
                 filters_applied.append(f"density ≤ {max_density}")
 
             if filters_applied:
@@ -838,29 +979,17 @@ def main():
             st.warning("No ZIPs pass all filters. Relax filter criteria.")
             st.stop()
 
-        # =====================================================================
-        # SCORING (Math Only or Blended)
-        # =====================================================================
         ranked = score_candidates(
             df, w_scarcity, w_health, w_income, w_pop,
             w_heat=w_heat, w_edu=w_edu, w_drive_time=w_drive_time,
             extra_feature_weights=extra_feature_weights,
         )
-        ranked['score'] = pd.to_numeric(ranked['score'], errors='coerce')
-        ranked = ranked.dropna(subset=['score'])
-        math_df = ranked[['zip', 'score']].rename(columns={'score': 'score_math'}).copy()
-
-        if scoring_mode == "Math Only":
-            ranked['final_score'] = ranked['score']
-            ranked['ai_score'] = np.nan
-            sort_col = 'final_score'
-            st.sidebar.success("Using Mathematical Model Only")
-        else:  # Blended
-            ai_df = read_ifae_csv("results/national_ifae_rank.csv")
-            combo = average_scores(math_df, ai_df, normalize=True)
-            ranked = ranked.merge(combo, on='zip', how='left')
-            sort_col = 'final_score'
-            st.sidebar.success("Using Blended Approach")
+        ranked["score"] = pd.to_numeric(ranked["score"], errors="coerce")
+        ranked = ranked.dropna(subset=["score"])
+        ranked["final_score"] = ranked["score"]
+        ranked["ai_score"] = np.nan
+        sort_col = "final_score"
+        st.sidebar.success("Using Mathematical Model")
 
     # =========================================================================
     # COMMON POST-PROCESSING (all modes)
@@ -879,30 +1008,70 @@ def main():
     # =========================================================================
     # UI OUTPUT
     # =========================================================================
-    st.write("### Top Pharmacy Desert Candidates")
+    ranking_view = "Best (Highest score)"
+    if scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"}:
+        ranking_view = st.radio(
+            "Ranking View",
+            ["Best (Highest score)", "Worst (Lowest score)"],
+            horizontal=True,
+            key=f"ranking_view_{scoring_mode}",
+            help="Toggle between highest-scoring and lowest-scoring ZIPs for this model.",
+        )
+    is_worst_view = ranking_view.startswith("Worst")
+    ranking_view_short = "Worst" if is_worst_view else "Best"
+
+    if scoring_mode == "Walgreens Optimizer v2":
+        st.write(f"### {ranking_view_short} Walgreens Viability ZIPs")
+    elif scoring_mode == "Profit Model v2":
+        st.write(f"### {ranking_view_short} Profit Opportunity ZIPs")
+    else:
+        st.write("### Top Pharmacy Desert Candidates")
     mode_labels = {
-        'Math Only': '🔢 Mathematical Model',
-        'GLM Only': '🧠 GLM+Hybrid Model (Poisson + GBDT/XGBoost)',
-        'Blended (Math + GLM)': '⚖️ Hybrid: Math + GLM'
+        "Math Only": "🔢 Mathematical Weighted Equation",
+        "GLM Only": "🧠 GLM Model",
+        "Profit Model v2": "💼 Walgreens Profit Model v2 (Part 2)",
+        "Walgreens Optimizer v2": "🏪 Walgreens Optimizer v2 (Part 3)",
     }
     st.caption(f"**Active Mode:** {mode_labels[scoring_mode]}")
+
+    if scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"}:
+        display_ranked = (
+            ranked.nsmallest(len(ranked), sort_col, keep="all").reset_index(drop=True)
+            if is_worst_view
+            else ranked.nlargest(len(ranked), sort_col, keep="all").reset_index(drop=True)
+        )
+        direction_text = "lowest" if is_worst_view else "highest"
+        st.caption(f"Showing {direction_text} `{sort_col}` ZIPs.")
+    else:
+        display_ranked = ranked.copy()
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total ZIPs Analyzed", f"{len(ranked):,}")
     with col2:
-        st.metric("Zero-Pharmacy Deserts", f"{(ranked['desert_flag'] == 1).sum():,}")
+        if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
+            st.metric("Closure Candidates", f"{(ranked['action'] == 'CLOSURE CANDIDATE').sum():,}")
+        elif scoring_mode == "Profit Model v2" and "is_pharmacy_desert" in ranked.columns:
+            desert_count = pd.to_numeric(ranked["is_pharmacy_desert"], errors="coerce").fillna(0).astype(int).sum()
+            st.metric("Pharmacy Deserts", f"{desert_count:,}")
+        else:
+            st.metric("Zero-Pharmacy Deserts", f"{(ranked['desert_flag'] == 1).sum():,}")
     with col3:
         st.metric("Avg Final Score", f"{ranked[sort_col].mean():.3f}")
     with col4:
-        if 'ai_score' in ranked.columns and ranked['ai_score'].notna().any():
+        if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
+            st.metric("Protect & Invest", f"{(ranked['action'] == 'PROTECT & INVEST').sum():,}")
+        elif scoring_mode == "Profit Model v2" and "tier" in ranked.columns:
+            premium_count = (ranked["tier"].astype(str) == "Premium").sum()
+            st.metric("Premium Tier ZIPs", f"{premium_count:,}")
+        elif 'ai_score' in ranked.columns and ranked['ai_score'].notna().any():
             ai_coverage = ranked['ai_score'].notna().sum()
             st.metric("GLM Coverage", f"{100 * ai_coverage / len(ranked):.1f}%")
         else:
-            st.metric("GLM Coverage", "0%")
+            st.metric("Model Coverage", "N/A")
 
-    # Weight distribution chart (Math/Blended modes only)
-    if scoring_mode != "GLM Only" and weights:
+    # Weight distribution chart (Math mode only)
+    if scoring_mode == "Math Only" and weights:
         active_weights = {k: v for k, v in weights.items() if v > 0}
         total_weight = sum(active_weights.values())
 
@@ -938,9 +1107,6 @@ def main():
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        if scoring_mode == "Blended (Math + GLM)":
-            st.info("In Blended mode, Math weights affect 50% of the final score")
-
     # Build show columns dynamically based on what exists
     show_cols = ['zip']
     
@@ -966,6 +1132,41 @@ def main():
     for c in optional_cols:
         if c in ranked.columns and c not in show_cols:
             show_cols.append(c)
+
+    if scoring_mode == "Profit Model v2":
+        profit_cols = [
+            "profit_score",
+            "profit_rank",
+            "tier",
+            "revenue_potential",
+            "cost_pressure",
+            "capture_rate",
+            "is_pharmacy_desert",
+            "desert_opportunity",
+        ]
+        for c in profit_cols:
+            if c in ranked.columns and c not in show_cols:
+                show_cols.append(c)
+
+    if scoring_mode == "Walgreens Optimizer v2":
+        walgreens_cols = [
+            "store_viability",
+            "viability_rank",
+            "action",
+            "archetype_name",
+            "tier",
+            "store_revenue",
+            "store_cost",
+            "store_position",
+            "walgreens_count",
+            "total_pharmacies",
+            "ml_justification_gap",
+            "anomaly_score",
+            "anomaly_type",
+        ]
+        for c in walgreens_cols:
+            if c in ranked.columns and c not in show_cols:
+                show_cols.append(c)
 
     # Revenue metrics from uploaded health economics files (with/without insurance).
     revenue_by_kind: dict[str, list[str]] = {
@@ -1037,46 +1238,79 @@ def main():
     with st.expander("Understanding the Scores", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Scores**: `score` (weighted math), `ai_score` (GLM), `final_score` (blend), `desert_flag` (zero-pharmacy indicator).")
-            st.markdown("**Scarcity**: 1/(1+n_pharmacies) — fewer pharmacies = higher scarcity score.")
+            if scoring_mode == "Math Only":
+                st.markdown("**Scores**: `score` and `final_score` are the weighted math score from the sliders.")
+                st.markdown("**Scarcity**: 1/(1+n_pharmacies) — fewer pharmacies = higher scarcity score.")
+            elif scoring_mode == "GLM Only":
+                st.markdown("**Scores**: `ai_score` and `final_score` come from the trained GLM model output.")
+            elif scoring_mode == "Profit Model v2":
+                st.markdown("**Scores**: `profit_score` and `final_score` come from Walgreens Part 2 economic scoring.")
+            else:
+                st.markdown("**Scores**: `store_viability` and `final_score` come from Walgreens Part 3 store optimization.")
         with c2:
-            st.markdown("**Scoring**: Each component is normalized [0,1], multiplied by its weight, and the sum is rescaled to [0,1]. Higher = more need.")
-            st.markdown("**Desert Flag**: ZIPs with **zero** pharmacies are flagged.")
+            if scoring_mode == "Math Only":
+                st.markdown("**Scoring**: Components are normalized [0,1], weighted, summed, then rescaled to [0,1].")
+            elif scoring_mode == "Profit Model v2":
+                st.markdown("**Scoring**: `profit_score` combines revenue potential, capture rate, and cost pressure.")
+            elif scoring_mode == "Walgreens Optimizer v2":
+                st.markdown("**Scoring**: `store_viability` combines store revenue, position, and cost.")
+            else:
+                st.markdown("**Scoring**: GLM output is precomputed from trained model artifacts.")
+            st.markdown("**Desert Flag**: ZIPs with zero pharmacies are flagged when available.")
 
-    st.dataframe(ranked[table_cols].head(50), use_container_width=True, height=400)
+    st.dataframe(display_ranked[table_cols].head(50), use_container_width=True, height=400)
 
     # Interactive Map
-    st.write("### Top 10 ZIPs on Interactive Map")
-    map_key = f"map_{scoring_mode}_{len(ranked)}"
+    if scoring_mode == "Walgreens Optimizer v2":
+        st.write(f"### {ranking_view_short} 10 Walgreens ZIPs on Interactive Map")
+    elif scoring_mode == "Profit Model v2":
+        st.write(f"### {ranking_view_short} 10 Profit ZIPs on Interactive Map")
+    else:
+        st.write("### Top 10 ZIPs on Interactive Map")
+    safe_mode_key = scoring_mode.lower().replace(" ", "_")
+    safe_view_key = ranking_view_short.lower()
+    map_key = f"map_{safe_mode_key}_{safe_view_key}_{len(display_ranked)}"
     if map_key not in st.session_state:
         st.session_state[map_key] = True
 
     render_top10_map(
-        ranked.head(10).copy(),
+        display_ranked.head(10).copy(),
         pharmacist_df=pharmacist_data,
         pharmacy_df=pharmacy_detail_data,
+        map_key=map_key,
     )
 
     # Export Results
     st.write("### Export Results")
     col1, col2 = st.columns(2)
     with col1:
+        export_prefix = {
+            "Math Only": "math_model",
+            "GLM Only": "glm_model",
+            "Profit Model v2": "profit_model_v2",
+            "Walgreens Optimizer v2": "walgreens_optimizer_v2",
+        }.get(scoring_mode, "results")
         st.download_button(
             "Download Full Results CSV", 
-            ranked.to_csv(index=False), 
-            "pharmacy_desert_candidates_full.csv", 
+            display_ranked.to_csv(index=False), 
+            f"{export_prefix}_full.csv", 
             "text/csv"
         )
     with col2:
+        top_bottom_label = "Top"
+        top_bottom_suffix = "top100"
+        if scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"} and is_worst_view:
+            top_bottom_label = "Bottom"
+            top_bottom_suffix = "bottom100"
         st.download_button(
-            "Download Top 100 CSV", 
-            ranked.head(100).to_csv(index=False), 
-            "pharmacy_desert_top100.csv", 
+            f"Download {top_bottom_label} 100 CSV",
+            display_ranked.head(100).to_csv(index=False),
+            f"{export_prefix}_{top_bottom_suffix}.csv",
             "text/csv"
         )
 
     st.divider()
-    st.caption("🏥 Pharmacy Desert Explorer | Hybrid AI + Mathematical Approach")
+    st.caption("🏥 Pharmacy Desert Explorer | GLM + Walgreens Portfolio + Mathematical Modes")
     st.caption("Built with Streamlit | Data refreshed on page load")
 
 
