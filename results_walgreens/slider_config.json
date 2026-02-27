@@ -1,0 +1,56 @@
+{
+  "sliders": [
+    {
+      "id": "w_rx_demand",
+      "default": 1.0
+    },
+    {
+      "id": "w_payer_quality",
+      "default": 1.0
+    },
+    {
+      "id": "w_market_size",
+      "default": 1.0
+    },
+    {
+      "id": "w_med_usage",
+      "default": 1.0
+    },
+    {
+      "id": "w_front_end_revenue",
+      "default": 1.0
+    },
+    {
+      "id": "w_occupancy_cost",
+      "default": 1.0
+    },
+    {
+      "id": "w_labor_cost",
+      "default": 1.0
+    },
+    {
+      "id": "w_walgreens_share",
+      "default": 1.0
+    },
+    {
+      "id": "w_competitor_threat",
+      "default": 1.0
+    },
+    {
+      "id": "w_cannibalization",
+      "default": 1.2
+    },
+    {
+      "id": "w_independent_vuln",
+      "default": 0.8
+    },
+    {
+      "id": "alpha_revenue_vs_cost",
+      "default": 0.6
+    },
+    {
+      "id": "beta_position_weight",
+      "default": 0.25
+    }
+  ]
+}

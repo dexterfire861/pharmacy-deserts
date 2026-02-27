@@ -51,9 +51,15 @@ def apply_file_mapping(
         raise ValueError(f"ZIP column '{zip_column}' not found in DataFrame. "
                         f"Available columns: {list(result.columns)}")
     
-    # 2. Select feature columns (plus zcta5)
+    # 2. Select feature columns (plus zcta5 and geo columns)
     feature_columns = mapping.get('feature_columns', [])
-    columns_to_keep = ['zcta5'] + [c for c in feature_columns if c in result.columns]
+    
+    # Always include common geo columns (lat/lon) if they exist, even if not in feature_columns
+    # This ensures lat/lon are available for mapping even if user didn't select them as features
+    geo_column_names = ['latitude', 'longitude', 'lat', 'lon', 'long', 'lng']
+    geo_columns = [col for col in result.columns if col.lower() in geo_column_names]
+    
+    columns_to_keep = ['zcta5'] + [c for c in feature_columns if c in result.columns] + geo_columns
     
     # Warn about missing columns
     missing = set(feature_columns) - set(result.columns)
@@ -210,53 +216,61 @@ def load_dataset_from_config(
     include_scoring_config: bool = False
 ) -> pd.DataFrame:
     """
-    Load a complete dataset according to its saved configuration.
-    
-    This is the main entry point for loading datasets that were uploaded
-    through the Upload Data wizard. It:
-    
-    1. Reads LATEST.json to get the current version (if version_id not specified)
-    2. Reads dataset_config.json to get source configurations
-    3. Loads each source file from storage
-    4. Applies mappings to normalize ZIPs and select/rename features
-    5. Merges all sources on zcta5
-    
+    Load a dataset from its stored configuration.
+
+    Prefers the unified CSV (single pre-merged file created at upload time).
+    Falls back to per-source loading for legacy dataset versions.
+
     Args:
         dataset_id: Unique identifier for the dataset
         version_id: Specific version to load (uses LATEST if not provided)
         storage: Storage backend (auto-detected if not provided)
         include_scoring_config: If True, returns (df, scoring_config) tuple
-    
+
     Returns:
-        Merged DataFrame with 'zcta5' as the key column and all
-        configured features from all sources.
+        DataFrame with 'zcta5' as the key column.
         If include_scoring_config=True, returns (DataFrame, ScoringConfig or None)
-    
-    Raises:
-        ValueError: If dataset or version not found
-        FileNotFoundError: If required files are missing
     """
-    # Get storage backend
     if storage is None:
         from storage.datasets import get_storage
         storage = get_storage()
-    
-    # Get version ID from LATEST if not specified
+
     if version_id is None:
         version_id = storage.get_latest_version(dataset_id)
         if version_id is None:
             raise ValueError(f"No versions found for dataset '{dataset_id}'")
         logger.info(f"Using latest version: {version_id}")
-    
-    # Load dataset configuration
+
     config = storage.get_config(dataset_id, version_id)
     if config is None:
         raise ValueError(f"Configuration not found for {dataset_id}/{version_id}")
-    
+
     logger.info(f"Loading dataset '{dataset_id}' version '{version_id}'")
-    logger.info(f"Sources: {len(config.get('sources', []))}")
-    
-    # Load and transform each source
+
+    # ------------------------------------------------------------------
+    # Try unified CSV first (new format)
+    # ------------------------------------------------------------------
+    if config.get('unified', False):
+        try:
+            csv_bytes = storage.download_unified_dataset(dataset_id, version_id)
+            merged = pd.read_csv(io.BytesIO(csv_bytes), low_memory=False)
+            for col in ('zcta5', 'zip'):
+                if col in merged.columns:
+                    merged[col] = merged[col].astype(str).str.zfill(5)
+            logger.info(f"Loaded unified dataset: {len(merged)} rows, {len(merged.columns)} columns")
+
+            if include_scoring_config:
+                scoring_config = get_scoring_config_from_dataset(dataset_id, version_id, storage)
+                return merged, scoring_config
+            return merged
+        except FileNotFoundError:
+            logger.warning("Unified CSV flag set but file not found — falling back to per-source loading")
+
+    # ------------------------------------------------------------------
+    # Legacy fallback: load individual sources and merge
+    # ------------------------------------------------------------------
+    logger.info(f"Loading {len(config.get('sources', []))} source(s) (legacy mode)")
+
     dataframes = []
     for source in config.get('sources', []):
         filename = source.get('filename', 'unknown')
@@ -266,19 +280,16 @@ def load_dataset_from_config(
         except Exception as e:
             logger.error(f"Failed to load source '{filename}': {e}")
             raise
-    
-    # Merge all dataframes
+
     if not dataframes:
         raise ValueError("No sources found in dataset configuration")
-    
+
     merged = merge_dataframes_on_zcta5(dataframes)
-    
     logger.info(f"Final merged dataset: {len(merged)} rows, {len(merged.columns)} columns")
-    
+
     if include_scoring_config:
         scoring_config = get_scoring_config_from_dataset(dataset_id, version_id, storage)
         return merged, scoring_config
-    
     return merged
 
 
@@ -404,12 +415,15 @@ def list_available_datasets(storage=None) -> List[Dict[str, Any]]:
         if latest:
             config = storage.get_config(dataset_id, latest)
             has_scoring = bool(config.get('scoring_config')) if config else False
+            source_count = 0
+            if config:
+                source_count = len(config.get('uploaded_files', {})) or len(config.get('sources', []))
             datasets.append({
                 'dataset_id': dataset_id,
                 'latest_version': latest,
-                'version': latest,  # Alias for convenience
+                'version': latest,
                 'created_at': config.get('created_at') if config else None,
-                'source_count': len(config.get('sources', [])) if config else 0,
+                'source_count': source_count,
                 'has_scoring_config': has_scoring,
                 'description': config.get('description', '') if config else '',
             })

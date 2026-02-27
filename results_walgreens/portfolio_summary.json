@@ -1,0 +1,23 @@
+{
+  "total_stores": 6664,
+  "mean_viability": 0.4376651218454812,
+  "action_distribution": {
+    "MONITOR": 1776,
+    "PROTECT & INVEST": 1520,
+    "CONSOLIDATE": 1493,
+    "CLOSURE CANDIDATE": 1186,
+    "REFORMAT": 510,
+    "EXPAND CLINICAL": 179
+  },
+  "archetype_distribution": {
+    "Middle Market": 2592,
+    "Fortress Store": 1640,
+    "Hidden Potential": 1547,
+    "Cannibalization Zone": 885
+  },
+  "consolidation_pairs": 2421,
+  "closure_candidates": 1186,
+  "protect_invest": 1520,
+  "anomaly_hidden_gems": 225,
+  "anomaly_hidden_risks": 109
+}

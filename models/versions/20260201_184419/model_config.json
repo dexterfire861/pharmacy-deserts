@@ -1,0 +1,30 @@
+{
+  "model_version": "20260201_184419",
+  "trained_at": "2026-02-01T18:44:19.920050",
+  "dataset_id": "pharmacy_data",
+  "dataset_version": "20260201_184419",
+  "data_sources": [
+    "health_data.csv",
+    "financial_data.csv",
+    "population_data.csv"
+  ],
+  "row_count": 41093,
+  "feature_columns": [
+    "health_outcome",
+    "Median income (dollars)",
+    "population",
+    "density",
+    "City",
+    "St"
+  ],
+  "scoring_config": null,
+  "training_params": {
+    "config_path": "/var/folders/1m/5nsmtnrd1q35fs00r7595vw00000gn/T/training_20260201_184419_mafu22f7/training_config.json"
+  },
+  "status": "active",
+  "metrics": {
+    "status": "placeholder",
+    "note": "Training script not yet adapted for automated metrics",
+    "training_duration_sec": 0.07154703140258789
+  }
+}

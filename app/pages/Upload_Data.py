@@ -1,1318 +1,1639 @@
 """
-Dataset Onboarding Wizard - Streamlit Page
+Upload Data — Streamlit Page
 
-Allows users to:
-- Upload multiple files (CSV, Excel, JSON, Parquet, ZIP)
-- Configure column mappings and ZIP normalization
-- Select and rename feature columns
-- Apply cleaning rules
-- Map columns to scoring components
-- Upload to S3 with versioning
+Simple upload page for known data file types.
+Runs the existing data pipeline (readers → preprocess → merge)
+and saves a unified dataset CSV.
 """
 import streamlit as st
 import pandas as pd
-import json
+import io
 import sys
+import logging
+import tempfile
+import traceback
+import re
 from pathlib import Path
-from datetime import datetime
 
-# Add parent directories to path
+logger = logging.getLogger(__name__)
+
 parent_dir = Path(__file__).parent.parent.parent.absolute()
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
 from app.config import get_config
 from app.auth import is_authenticated, login_form
-from ingestion.parsers import (
-    get_file_type, get_excel_sheet_names, parse_file, 
-    extract_zip_contents, get_column_types, get_column_stats
+from data.loaders import (
+    read_financial_data, read_health_data,
+    read_population_data, read_hhi_excel, read_education_data_acs,
+    read_hud_zip_county_crosswalk, read_county_desert_csv,
+    downscale_county_to_zip,
 )
-from ingestion.normalize import (
-    NORMALIZATION_MODES, normalize_zip_column, 
-    detect_zip_column, suggest_normalization_mode
-)
+from data.features import preprocess
 from storage.datasets import (
-    get_storage, generate_version_id, build_dataset_config, build_file_mapping
-)
-from models.schema import (
-    SCORING_COMPONENTS, COMPONENT_CATEGORIES, REQUIRED_COMPONENTS,
-    SCORED_COMPONENTS, ScoreDirection, ScoringConfig, ColumnMapping
-)
-
-# Page configuration
-st.set_page_config(
-    page_title="Upload Data - Pharmacy Desert Explorer",
-    page_icon="📤",
-    layout="wide"
+    get_storage,
+    generate_version_id,
+    generate_source_id,
+    build_dataset_config,
 )
 
-# Authentication check
+st.set_page_config(page_title="Upload Data", page_icon="📤", layout="wide")
+
 config = get_config()
 if config.require_auth and not is_authenticated():
     login_form()
     st.stop()
 
+DATASET_ID = "pharmacy_data"
 
-def init_session_state():
-    """Initialize session state variables."""
-    if 'upload_files' not in st.session_state:
-        st.session_state.upload_files = {}  # filename -> {content, df, config}
-    if 'dataset_id' not in st.session_state:
-        st.session_state.dataset_id = "pharmacy_data"  # Fixed combined dataset
-    if 'current_step' not in st.session_state:
-        st.session_state.current_step = 1
-    if 'file_configs' not in st.session_state:
-        st.session_state.file_configs = {}  # filename -> config dict
-    if 'scoring_mappings' not in st.session_state:
-        st.session_state.scoring_mappings = {}  # component_name -> source_column
-    if 'weight_overrides' not in st.session_state:
-        st.session_state.weight_overrides = {}
-    if 'version_description' not in st.session_state:
-        st.session_state.version_description = ""  # Description for this version
+# ── Known data-file slots ────────────────────────────────────────────────────
+# (key, label, accepted_extensions, required, help_text)
+SLOTS = [
+    ("financial",     "Financial / Income Data *",   ["csv"],                 True,
+     "Census CSV — must have NAME and S1901_C01_012E columns"),
+    ("health",        "Health Burden Data *",         ["csv"],                 True,
+     "PLACES CSV — must have ZCTA5 and GHLTH_CrudePrev columns"),
+    ("pharmacy",      "Pharmacy Locations *",         ["csv", "xlsx", "xlsm"], True,
+     "File with a ZIP column — one row per pharmacy location"),
+    ("population",    "Population / Density Data *",  ["csv"],                 True,
+     "CSV with Zip, Population, Density, Lat, Long (10-row header skip)"),
+    ("hhi",           "Heat-Health Index (HHI)",      ["xlsx", "xls"],         False,
+     "Excel with ZCTA, HHB_SCORE columns"),
+    ("hud_crosswalk", "HUD ZIP↔County Crosswalk",    ["xlsx", "xls", "csv"],  False,
+     "HUD file with ZIP, COUNTY, TOT_RATIO columns"),
+    ("county_desert", "County Desert Data",           ["csv"],                 False,
+     "CSV with county FIPS and desert flag/score column"),
+]
+
+SCORING_MAPPING_TARGETS = [
+    {
+        "component": "pharmacy_count",
+        "label": "Pharmacy count input",
+        "default_column": "n_pharmacies",
+        "help": "Used by the Pharmacy Scarcity slider.",
+    },
+    {
+        "component": "population",
+        "label": "Population input",
+        "default_column": "population",
+        "help": "Used for population context and area filters.",
+    },
+    {
+        "component": "income",
+        "label": "Income input",
+        "default_column": "median_income",
+        "help": "Used by the Income (inverted) slider.",
+    },
+    {
+        "component": "health_burden",
+        "label": "Health burden input",
+        "default_column": "health_burden",
+        "help": "Used by the Health Burden slider.",
+    },
+    {
+        "component": "pop_density",
+        "label": "Population density input",
+        "default_column": "pop_density",
+        "help": "Used by the Population Density slider.",
+    },
+    {
+        "component": "education_low",
+        "label": "Low education input",
+        "default_column": "edu_hs_or_lower_pct",
+        "help": "Optional slider input for educational vulnerability.",
+    },
+    {
+        "component": "drive_time",
+        "label": "Drive-time input",
+        "default_column": "zip_drive_time",
+        "help": "Optional slider input for pharmacy drive-time burden.",
+    },
+    {
+        "component": "heat_vulnerability",
+        "label": "Heat vulnerability input",
+        "default_column": "heat_hhb",
+        "help": "Optional slider input for heat-health burden.",
+    },
+    {
+        "component": "latitude",
+        "label": "Latitude input",
+        "default_column": "lat",
+        "help": "Used for map display.",
+    },
+    {
+        "component": "longitude",
+        "label": "Longitude input",
+        "default_column": "lon",
+        "help": "Used for map display.",
+    },
+]
+
+CORE_DEFAULT_COLUMNS = [
+    "zip",
+    "n_pharmacies",
+    "median_income",
+    "health_burden",
+    "population",
+    "pop_density",
+    "lat",
+    "lon",
+]
+
+DEFAULT_CORE_SKIP_ROWS = {
+    "financial": 0,
+    "health": 0,
+    "pharmacy": 0,
+    "population": 10,
+    "hhi": 0,
+    "hud_crosswalk": 0,
+    "county_desert": 0,
+}
+
+ZIP_NORMALIZATION_LABELS = {
+    "extract_5_digit_regex": "Extract first 5-digit sequence (default)",
+    "already_5_digit": "Treat values as ZIPs and zero-pad to 5 digits (supports 4-digit inputs)",
+    "zip_plus_4": "Prefer ZIP+4 format, fallback to first 5 digits",
+}
+
+FILL_UNCOVERED_LABELS = {
+    "none": "Leave uncovered ZIPs as missing values",
+    "mean": "Fill uncovered ZIPs with mean of numeric columns from this file",
+    "median": "Fill uncovered ZIPs with median of numeric columns from this file",
+}
+
+DEFAULT_CUSTOM_FEATURE_WEIGHT = 0.05
+
+REVENUE_POTENTIAL_COLUMN_ALIASES = [
+    "Grand_total_without_cancer_insurace_paying",
+    "Grand_total_without_cancer_insurance_paying",
+]
+REVENUE_WITHOUT_INSURANCE_COLUMN_ALIASES = [
+    "Grand_total_without_cancer",
+]
+REVENUE_WITH_CANCER_COLUMN_ALIASES = [
+    "Grand_total_with_cancer",
+]
 
 
-def render_step_indicator(current_step: int, total_steps: int = 5):
-    """Render a visual step indicator."""
-    steps = [
-        "📁 Upload Files", 
-        "⚙️ Configure Columns", 
-        "🧹 Cleaning Rules", 
-        "🎯 Scoring Config",
-        "✅ Review & Submit"
-    ]
-    cols = st.columns(total_steps)
-    for i, (col, step_name) in enumerate(zip(cols, steps), 1):
-        with col:
-            if i < current_step:
-                st.success(f"✓ {step_name}")
-            elif i == current_step:
-                st.info(f"→ {step_name}")
-            else:
-                st.markdown(f"○ {step_name}")
+def _normalize_skip_rows(value: int, default: int = 0) -> int:
+    """Normalize skip_rows input to a safe non-negative int."""
+    try:
+        out = int(value)
+    except Exception:
+        out = int(default)
+    return max(0, out)
 
 
-def render_file_upload_section():
-    """Render the file upload section (Step 1)."""
-    st.header("📁 Step 1: Upload Data Files")
-    
-    # Fixed dataset ID - all files go to one combined dataset
-    DATASET_ID = "pharmacy_data"
-    st.session_state.dataset_id = DATASET_ID
-    
-    # Explanation
-    st.info("""
-    **How it works:** Upload your data files here. Each file should contain ZIP/ZCTA codes.
-    All files will be automatically merged on ZCTA5 (outer join) to create a combined dataset.
-    
-    **Common data types:**
-    - 📊 Financial data (income, poverty rates)
-    - 🏥 Health data (health outcomes, insurance coverage)  
-    - 💊 Pharmacy locations
-    - 👥 Population/demographics
-    - 🗺️ Geographic data (lat/lon coordinates)
-    """)
-    
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        # Show existing sources
-        storage = get_storage()
-        try:
-            existing_config = storage.get_config(DATASET_ID)
-            if existing_config:
-                existing_sources = existing_config.get('sources', [])
-                if existing_sources:
-                    st.success(f"✓ {len(existing_sources)} existing data source(s)")
-                    with st.expander("View existing sources"):
-                        for src in existing_sources:
-                            st.write(f"• {src.get('filename', 'unknown')}")
-        except:
-            pass
-    
-    with col2:
-        st.markdown("### Environment")
-        env_badge = "🟢 Production (S3)" if config.is_production else "🔵 Development (Local)"
-        st.info(env_badge)
-    
-    st.markdown("---")
-    
-    # Version description
-    st.markdown("### Version Description")
-    version_desc = st.text_input(
-        "What's in this version?",
-        value=st.session_state.version_description,
-        placeholder="e.g., Added health data, fixed income column mapping",
-        help="A short description to help identify this version later"
+def _zip_mode_label(mode: str) -> str:
+    return ZIP_NORMALIZATION_LABELS.get(mode, mode)
+
+
+def _normalized_col_key(col_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col_name or "").strip().lower()).strip("_")
+
+
+def _is_revenue_potential_column(col_name: str) -> bool:
+    """Detect revenue-potential columns from known names/patterns."""
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_POTENTIAL_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    if "revenue_potential" in normalized or "revenue_with_insurance" in normalized:
+        return True
+    return (
+        "grand_total" in normalized
+        and "without_cancer" in normalized
+        and ("insurace" in normalized or "insurance" in normalized)
     )
-    st.session_state.version_description = version_desc
-    
-    st.markdown("---")
-    
-    # Data Source Tabs: File Upload vs API
-    source_tab = st.radio(
-        "Add data from:",
-        ["📁 Upload Files", "🌐 Connect API"],
-        horizontal=True,
-        key="source_type_tab"
+
+
+def _is_revenue_without_insurance_column(col_name: str) -> bool:
+    """Detect revenue columns representing values without insurance."""
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_WITHOUT_INSURANCE_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    if "revenue_without_insurance" in normalized:
+        return True
+    return (
+        "grand_total" in normalized
+        and "without_cancer" in normalized
+        and ("insurance" not in normalized and "insurace" not in normalized)
     )
-    
-    st.markdown("---")
-    
-    if source_tab == "📁 Upload Files":
-        # File uploader
-        uploaded_files = st.file_uploader(
-            "Upload data files",
-            type=['csv', 'xlsx', 'xlsm', 'json', 'parquet', 'zip'],
-            accept_multiple_files=True,
-            help="Supported formats: CSV, Excel (xlsx/xlsm), JSON, Parquet, ZIP archives"
+
+
+def _is_revenue_with_cancer_column(col_name: str) -> bool:
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_WITH_CANCER_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    return "grand_total" in normalized and "with_cancer" in normalized
+
+
+def _is_revenue_metric_column(col_name: str) -> bool:
+    return (
+        _is_revenue_potential_column(col_name)
+        or _is_revenue_without_insurance_column(col_name)
+        or _is_revenue_with_cancer_column(col_name)
+    )
+
+
+def _is_numeric_scoring_candidate(values: pd.Series, min_valid_ratio: float = 0.50) -> bool:
+    """Check whether a column is suitable as a weighted numeric scoring feature."""
+    if pd.api.types.is_numeric_dtype(values):
+        return values.notna().any()
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    observed = values.notna()
+    observed_count = int(observed.sum())
+    if observed_count == 0:
+        return False
+    valid_ratio = float(numeric[observed].notna().mean())
+    return valid_ratio >= min_valid_ratio
+
+
+def _coerce_numeric_like_series(
+    values: pd.Series,
+    min_valid_ratio: float = 0.80,
+) -> tuple[pd.Series, bool]:
+    """
+    Convert numeric-like string columns (currency, percent, comma-separated)
+    to numeric when conversion is reliable.
+    """
+    if pd.api.types.is_numeric_dtype(values):
+        return pd.to_numeric(values, errors="coerce"), True
+
+    cleaned = values.astype(str).str.strip()
+    cleaned = cleaned.replace(
+        {
+            "": None,
+            "nan": None,
+            "NaN": None,
+            "None": None,
+            "none": None,
+            "N/A": None,
+            "n/a": None,
+            "(X)": None,
+        }
+    )
+    cleaned = (
+        cleaned.str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("%", "", regex=False)
+    )
+    numeric = pd.to_numeric(cleaned, errors="coerce")
+    observed = cleaned.notna()
+    observed_count = int(observed.sum())
+    if observed_count == 0:
+        return values, False
+    valid_ratio = float(numeric[observed].notna().mean())
+    if valid_ratio >= min_valid_ratio:
+        return numeric, True
+    return values, False
+
+
+def _read_custom_bytes(
+    content: bytes,
+    filename: str,
+    skip_rows: int = 0,
+    sheet_name: str | int | None = None,
+) -> pd.DataFrame:
+    """Read a custom file from raw bytes (CSV or Excel)."""
+    ext = Path(filename).suffix.lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        selected_sheet = 0 if sheet_name in (None, "") else sheet_name
+        df = pd.read_excel(io.BytesIO(content), skiprows=skip_rows, sheet_name=selected_sheet)
+    else:
+        df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _normalize_zip_series(values: pd.Series, mode: str = "extract_5_digit_regex") -> pd.Series:
+    """Normalize ZIP values using a selected strategy."""
+    s = values.astype(str).str.strip()
+
+    if mode == "already_5_digit":
+        out = s.str.split(".", n=1).str[0]
+        out = out.where(out.str.fullmatch(r"\d{1,5}", na=False))
+        out = out.str.zfill(5)
+    elif mode == "zip_plus_4":
+        zip5 = s.str.extract(r"^(\d{5})(?:[-\s]?\d{4})?$")[0]
+        out = zip5.where(zip5.notna(), s.str.extract(r"(\d{5})")[0])
+    else:
+        out = s.str.extract(r"(\d{5})")[0]
+
+    return out.where(out.notna(), None)
+
+
+def _sanitize_column_prefix(value: str) -> str:
+    """Sanitize a custom prefix so merged columns are predictable."""
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", str(value or "").strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned
+
+
+def _suggest_short_feature_name(value: str, max_len: int = 40) -> str:
+    """Generate a compact, readable output name for long source columns."""
+    text = str(value or "").strip()
+    if _is_revenue_without_insurance_column(text):
+        return "revenue_without_insurance"
+    if _is_revenue_potential_column(text):
+        return "revenue_potential"
+    if _is_revenue_with_cancer_column(text):
+        return "revenue_with_cancer"
+    text = text.replace("!!", " ")
+    text = re.sub(
+        r"\b(estimate|margin of error|civilian noninstitutionalized population|"
+        r"coverage alone or in combination|coverage alone|private health insurance alone or in combination|"
+        r"private coverage|percent private coverage|total)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[^0-9A-Za-z]+", "_", text.lower())
+    text = re.sub(r"_+", "_", text).strip("_")
+
+    stop_words = {
+        "or", "in", "and", "of", "the", "with", "without",
+        "civilian", "noninstitutionalized", "population",
+        "estimate", "margin", "error", "total", "coverage",
+        "private", "percent",
+    }
+    parts = [p for p in text.split("_") if p and p not in stop_words]
+    compact = "_".join(parts) if parts else text
+
+    compact = _sanitize_column_prefix(compact) or "feature"
+    if len(compact) > max_len:
+        compact = compact[:max_len].rstrip("_")
+    return compact or "feature"
+
+
+def _final_output_name_for_selected_column(source_col: str, rename_map: dict | None) -> str:
+    """Resolve the output feature name for a selected source column."""
+    if isinstance(rename_map, dict):
+        candidate = rename_map.get(source_col)
+        if isinstance(candidate, str) and candidate.strip():
+            return _sanitize_column_prefix(candidate) or source_col
+    return source_col
+
+
+def _resolve_column_rename_map(selected_columns: list[str], rename_map: dict | None) -> dict[str, str]:
+    """Resolve selected column output names with sanitized, unique targets."""
+    if not selected_columns:
+        return {}
+    if not isinstance(rename_map, dict):
+        return {c: c for c in selected_columns}
+
+    resolved: dict[str, str] = {}
+    used_names: set[str] = set()
+    for src_col in selected_columns:
+        base_name = _final_output_name_for_selected_column(src_col, rename_map)
+        base_name = _sanitize_column_prefix(base_name) or _sanitize_column_prefix(src_col) or "feature"
+        target_name = base_name
+        idx = 2
+        while target_name in used_names:
+            target_name = f"{base_name}_{idx}"
+            idx += 1
+        used_names.add(target_name)
+        resolved[src_col] = target_name
+    return resolved
+
+
+def _prepare_custom_dataframe(raw_df: pd.DataFrame, meta: dict) -> tuple[pd.DataFrame, dict]:
+    """
+    Normalize and prepare a custom upload for merging on ZIP.
+
+    Supports feature selection, optional prefixing, and duplicate ZIP aggregation.
+    """
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    zip_col = meta.get("zip_col")
+    if not zip_col or zip_col not in df.columns:
+        raise ValueError(
+            f"ZIP column '{zip_col}' not found in {meta.get('name', 'custom file')}. "
+            f"Available columns: {list(df.columns)}"
         )
-        
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                filename = uploaded_file.name
-                file_content = uploaded_file.read()
-                file_type = get_file_type(filename)
-                
-                # Handle ZIP files
-                if file_type == 'zip':
-                    st.info(f"📦 Extracting ZIP archive: {filename}")
-                    try:
-                        extracted = extract_zip_contents(file_content)
-                        for inner_name, inner_content in extracted.items():
-                            inner_type = get_file_type(inner_name)
-                            if inner_type in ['csv', 'xlsx', 'xlsm', 'json', 'parquet']:
-                                st.session_state.upload_files[inner_name] = {
-                                    'content': inner_content,
-                                    'type': inner_type,
-                                    'df': None,
-                                    'from_zip': filename
-                                }
-                                st.success(f"  ↳ Extracted: {inner_name}")
-                    except Exception as e:
-                        st.error(f"Failed to extract {filename}: {e}")
+
+    selected_columns = meta.get("selected_columns")
+    if selected_columns:
+        selected_columns = [c for c in selected_columns if c in df.columns and c != zip_col]
+    else:
+        selected_columns = [c for c in df.columns if c != zip_col]
+
+    zip_mode = meta.get("zip_normalization_mode", "extract_5_digit_regex")
+    df["zip"] = _normalize_zip_series(df[zip_col], mode=zip_mode)
+    df = df.dropna(subset=["zip"])
+
+    keep_cols = ["zip"] + selected_columns
+    df = df[[c for c in keep_cols if c in df.columns]]
+
+    # Convert ACS-style "(X)" markers to missing values so they do not
+    # appear as literal strings in the final dataset or scoring inputs.
+    x_marker_cells_cleaned = 0
+    for col in [c for c in selected_columns if c in df.columns]:
+        mask = df[col].astype(str).str.fullmatch(r"\s*\(X\)\s*", na=False)
+        x_marker_cells_cleaned += int(mask.sum())
+        if mask.any():
+            df.loc[mask, col] = pd.NA
+
+    column_renames_input = meta.get("column_renames", {})
+    resolved_column_renames: dict[str, str] = {}
+    if isinstance(column_renames_input, dict) and selected_columns:
+        resolved_column_renames = _resolve_column_rename_map(selected_columns, column_renames_input)
+        rename_map = {
+            src_col: dst_col
+            for src_col, dst_col in resolved_column_renames.items()
+            if src_col != dst_col and src_col in df.columns
+        }
+        resolved_selected_columns = [resolved_column_renames.get(c, c) for c in selected_columns if c in df.columns]
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        selected_columns = resolved_selected_columns
+
+    coerced_numeric_columns: list[str] = []
+    for col in [c for c in df.columns if c != "zip"]:
+        coerced, did_coerce = _coerce_numeric_like_series(df[col])
+        if did_coerce:
+            df[col] = coerced
+            coerced_numeric_columns.append(col)
+
+    column_prefix = _sanitize_column_prefix(meta.get("column_prefix", ""))
+    rename_map = {}
+    if column_prefix:
+        rename_map = {col: f"{column_prefix}__{col}" for col in selected_columns if col in df.columns}
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    duplicate_policy = meta.get("duplicate_policy", "first")
+    duplicate_policy = duplicate_policy if duplicate_policy in {"first", "mean", "sum", "max", "min"} else "first"
+
+    if duplicate_policy == "first":
+        df = df.drop_duplicates(subset=["zip"], keep="first")
+    else:
+        feature_cols = [c for c in df.columns if c != "zip"]
+        agg_map = {}
+        for col in feature_cols:
+            agg_map[col] = duplicate_policy if pd.api.types.is_numeric_dtype(df[col]) else "first"
+        if agg_map:
+            df = df.groupby("zip", as_index=False).agg(agg_map)
+        else:
+            df = df.drop_duplicates(subset=["zip"], keep="first")
+
+    info = {
+        "rows": len(df),
+        "columns": [c for c in df.columns if c != "zip"],
+        "column_prefix": column_prefix,
+        "column_renames": resolved_column_renames,
+        "duplicate_policy": duplicate_policy,
+        "zip_normalization_mode": zip_mode,
+        "x_marker_cells_cleaned": x_marker_cells_cleaned,
+        "coerced_numeric_columns": coerced_numeric_columns,
+    }
+    return df, info
+
+
+def _merge_custom_into_dataset(
+    base_df: pd.DataFrame, custom_df: pd.DataFrame, meta: dict
+) -> tuple[pd.DataFrame, int, int]:
+    """Merge a prepared custom dataframe into the base dataset with collision handling."""
+    df = base_df
+    custom = custom_df.copy()
+    join_mode = meta.get("join_mode", "outer")
+    join_mode = join_mode if join_mode in {"left", "outer", "inner"} else "outer"
+    fill_uncovered_strategy = meta.get("fill_uncovered_strategy", "none")
+    fill_uncovered_strategy = (
+        fill_uncovered_strategy
+        if fill_uncovered_strategy in {"none", "mean", "median"}
+        else "none"
+    )
+
+    source_suffix = _sanitize_column_prefix(Path(meta.get("name", "custom")).stem) or "custom"
+    custom_feature_cols = [c for c in custom.columns if c != "zip"]
+    conflicts = [c for c in custom_feature_cols if c in df.columns]
+
+    if conflicts:
+        collision_renames = {}
+        used_names = set(df.columns) | {c for c in custom.columns if c not in conflicts}
+        for original in conflicts:
+            renamed = f"{original}_{source_suffix}"
+            while renamed in used_names:
+                renamed = f"{renamed}_x"
+            collision_renames[original] = renamed
+            used_names.add(renamed)
+        custom = custom.rename(columns=collision_renames)
+
+    fill_values: dict[str, float] = {}
+    if fill_uncovered_strategy in {"mean", "median"}:
+        for col in [c for c in custom.columns if c != "zip"]:
+            series = pd.to_numeric(custom[col], errors="coerce")
+            if series.notna().any():
+                if fill_uncovered_strategy == "mean":
+                    fill_values[col] = float(series.mean())
                 else:
-                    st.session_state.upload_files[filename] = {
-                        'content': file_content,
-                        'type': file_type,
-                        'df': None,
-                        'from_zip': None
-                    }
-    
-    # Show uploaded files (shown for both tabs)
-    if st.session_state.upload_files:
-        st.markdown("### Uploaded Files")
-        
-        for filename, file_info in st.session_state.upload_files.items():
-            with st.expander(f"📄 {filename} ({file_info['type'].upper()})", expanded=False):
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    # Excel sheet selection
-                    sheet_name = None
-                    if file_info['type'] in ['xlsx', 'xlsm']:
-                        try:
-                            sheets = get_excel_sheet_names(file_info['content'])
-                            sheet_name = st.selectbox(
-                                f"Select sheet for {filename}",
-                                options=sheets,
-                                key=f"sheet_{filename}"
-                            )
-                        except Exception as e:
-                            st.error(f"Error reading sheets: {e}")
-                    
-                    # Skip rows for CSV/Excel
-                    skip_rows = 0
-                    if file_info['type'] in ['csv', 'xlsx', 'xlsm']:
-                        skip_rows = st.number_input(
-                            f"Skip rows (header offset)",
+                    fill_values[col] = float(series.median())
+
+    before_cols = len(df.columns)
+    use_indicator = bool(fill_values)
+    merged = df.merge(custom, on="zip", how=join_mode, indicator=use_indicator)
+
+    filled_cells = 0
+    if use_indicator and "_merge" in merged.columns:
+        uncovered_mask = merged["_merge"] == "left_only"
+        if uncovered_mask.any():
+            for col, value in fill_values.items():
+                if col not in merged.columns:
+                    continue
+                needs_fill = uncovered_mask & merged[col].isna()
+                filled_cells += int(needs_fill.sum())
+                if needs_fill.any():
+                    merged.loc[needs_fill, col] = value
+        merged = merged.drop(columns=["_merge"])
+
+    added_cols = len(merged.columns) - before_cols
+    return merged, added_cols, filled_cells
+
+
+def _predict_custom_output_columns(custom_uploads: list[dict]) -> list[str]:
+    """Predict merged custom column names from current upload selections."""
+    predicted: list[str] = []
+    for upload in custom_uploads or []:
+        selected_columns = upload.get("selected_columns") or []
+        column_renames = upload.get("column_renames", {})
+        resolved_column_names = _resolve_column_rename_map(selected_columns, column_renames)
+        prefix = _sanitize_column_prefix(upload.get("column_prefix", ""))
+        for col in selected_columns:
+            out_col = resolved_column_names.get(col, col)
+            predicted.append(f"{prefix}__{out_col}" if prefix else out_col)
+    return predicted
+
+
+def _build_mapping_column_options(
+    prev_config: dict,
+    custom_uploads: list[dict],
+    prev_custom: list[dict],
+    replace_prev_custom: bool,
+) -> list[str]:
+    """Build candidate source columns for constrained scoring mappings."""
+    candidates: set[str] = set(CORE_DEFAULT_COLUMNS)
+
+    if prev_config:
+        for col in prev_config.get("unified_columns", []):
+            if isinstance(col, str):
+                candidates.add(col)
+
+    for col in _predict_custom_output_columns(custom_uploads):
+        candidates.add(col)
+
+    if prev_custom and not replace_prev_custom:
+        for meta in prev_custom:
+            if not isinstance(meta, dict):
+                continue
+            for col in meta.get("merged_columns", []):
+                if isinstance(col, str):
+                    candidates.add(col)
+
+    return sorted(candidates)
+
+
+def _read_pharmacy_upload(
+    path: str,
+    skip_rows: int = 0,
+    zip_normalization_mode: str = "extract_5_digit_regex",
+) -> pd.DataFrame:
+    """Read an uploaded pharmacy file (CSV or Excel) and ensure a ZIP column exists."""
+    ext = Path(path).suffix.lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        df = pd.read_excel(path, skiprows=skip_rows)
+    else:
+        df = pd.read_csv(path, skiprows=skip_rows)
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    for candidate in ["ZIP", "zip", "Zip", "ZCTA5", "zcta5", "Short_ZIP", "Short_ ZIP"]:
+        if candidate in df.columns:
+            if candidate != "ZIP":
+                df = df.rename(columns={candidate: "ZIP"})
+            break
+    else:
+        for c in df.columns:
+            if "zip" in c.lower() or "zcta" in c.lower():
+                df = df.rename(columns={c: "ZIP"})
+                break
+        else:
+            raise ValueError(f"No ZIP column found. Available: {df.columns.tolist()[:10]}")
+
+    df["ZIP"] = _normalize_zip_series(df["ZIP"], mode=zip_normalization_mode)
+    valid_zip_count = int(df["ZIP"].notna().sum())
+    if valid_zip_count == 0:
+        raise ValueError(
+            "No valid ZIP values found in pharmacy file after normalization. "
+            f"Mode used: {zip_normalization_mode}"
+        )
+
+    return df.dropna(subset=["ZIP"])
+
+
+# ── Main page ────────────────────────────────────────────────────────────────
+
+def main():
+    st.title("Upload Data")
+    st.markdown(
+        "Upload your data files to build the analysis dataset. "
+        "Required files are marked with **\\***. "
+        "Files from the previous version are reused automatically if you don't upload a replacement."
+    )
+
+    storage = get_storage()
+    latest_version = storage.get_latest_version(DATASET_ID)
+    prev_config = None
+    prev_files: dict = {}
+
+    # ── Current dataset status ───────────────────────────────────────────
+    if latest_version:
+        prev_config = storage.get_config(DATASET_ID, latest_version)
+        if prev_config:
+            prev_files = prev_config.get("uploaded_files", {})
+            rows = prev_config.get("unified_rows")
+            ncols = len(prev_config.get("unified_columns", []))
+            desc = prev_config.get("description", "")
+            rows_str = f"{rows:,}" if isinstance(rows, int) else str(rows or "?")
+            st.success(
+                f"Current dataset: v`{latest_version}` — "
+                f"{rows_str} rows × {ncols} columns"
+                + (f" — _{desc}_" if desc else "")
+            )
+            with st.expander("View current columns"):
+                st.write(prev_config.get("unified_columns", []))
+    else:
+        st.info("No dataset yet. Upload the required files below to create one.")
+
+    st.divider()
+
+    # ── File uploaders ───────────────────────────────────────────────────
+    st.header("Data Files")
+
+    uploads: dict = {}  # key → UploadedFile
+    for key, label, exts, _required, help_text in SLOTS:
+        existing_tag = ""
+        if key in prev_files:
+            existing_tag = f"  ✓ _({prev_files[key]} from previous version)_"
+
+        uploaded = st.file_uploader(
+            f"{label}{existing_tag}", type=exts, key=f"up_{key}", help=help_text
+        )
+        if uploaded:
+            uploads[key] = uploaded
+
+    replace_prev_core = st.checkbox(
+        "Replace previously uploaded core files (do not carry forward old core files)",
+        value=False,
+        help=(
+            "When enabled, only files uploaded in this run are used for core slots. "
+            "Required core files must be uploaded again."
+        ),
+    )
+
+    if replace_prev_core:
+        st.info("Core replace mode is ON. Required core files must be uploaded in this run.")
+
+    prev_core_parse_options = prev_config.get("core_parse_options", {}) if prev_config else {}
+    core_skip_rows: dict[str, int] = {}
+    with st.expander("Core parsing options (row skipping and ZIP handling)", expanded=False):
+        st.caption(
+            "Use these controls when files include extra metadata/header rows "
+            "or non-standard ZIP formats."
+        )
+        for key, label, *_ in SLOTS:
+            default_skip = _normalize_skip_rows(
+                prev_core_parse_options.get(key, DEFAULT_CORE_SKIP_ROWS.get(key, 0)),
+                default=DEFAULT_CORE_SKIP_ROWS.get(key, 0),
+            )
+            core_skip_rows[key] = int(
+                st.number_input(
+                    f"{label.rstrip(' *')} rows to skip before header",
+                    min_value=0,
+                    max_value=500,
+                    value=default_skip,
+                    step=1,
+                    key=f"core_skip_{key}",
+                )
+            )
+
+        zip_mode_options = list(ZIP_NORMALIZATION_LABELS.keys())
+        prev_zip_mode = prev_core_parse_options.get(
+            "pharmacy_zip_normalization_mode", "extract_5_digit_regex"
+        )
+        if prev_zip_mode not in zip_mode_options:
+            prev_zip_mode = "extract_5_digit_regex"
+        pharmacy_zip_normalization_mode = st.selectbox(
+            "Pharmacy ZIP normalization",
+            options=zip_mode_options,
+            index=zip_mode_options.index(prev_zip_mode),
+            key="core_zip_mode_pharmacy",
+            format_func=_zip_mode_label,
+        )
+
+    # Check which required slots are satisfied (new upload OR previous version)
+    required_keys = {key for key, _, _, req, _ in SLOTS if req}
+    available_keys = set(uploads.keys()) if replace_prev_core else set(uploads.keys()) | set(prev_files.keys())
+    missing = required_keys - available_keys
+
+    if missing:
+        pretty = ", ".join(
+            next(lbl.rstrip(" *") for k, lbl, *_ in SLOTS if k == m)
+            for m in sorted(missing)
+        )
+        st.warning(f"Missing required: **{pretty}**")
+
+    st.divider()
+
+    # ── Custom / Proprietary Data ────────────────────────────────────────
+    st.header("Custom / Proprietary Data")
+    st.markdown(
+        "Upload any additional CSV or Excel files your organization has. "
+        "Each file must contain a **ZIP / ZCTA column** so it can be joined "
+        "to the core dataset. You can choose which columns to include per file."
+    )
+    st.caption(
+        "Numeric columns from uploaded custom files are automatically added as "
+        "optional weighted features in Math/Blended scoring."
+    )
+
+    prev_custom = prev_config.get("custom_files", []) if prev_config else []
+    prev_custom_by_name = {
+        pc.get("filename"): pc for pc in prev_custom if isinstance(pc, dict) and pc.get("filename")
+    }
+
+    custom_files = st.file_uploader(
+        "Upload custom data files",
+        type=["csv", "xlsx", "xlsm", "xls"],
+        accept_multiple_files=True,
+        key="custom_uploads",
+        help="Each file needs a column with 5-digit ZIP or ZCTA codes.",
+    )
+
+    custom_uploads_ready: list[dict] = []
+
+    if custom_files:
+        for ix, cf in enumerate(custom_files):
+            file_key = f"{ix}_{cf.name}"
+            prev_custom_meta = prev_custom_by_name.get(cf.name, {})
+            with st.expander(f"📄 {cf.name}", expanded=True):
+                try:
+                    ext = Path(cf.name).suffix.lower()
+                    selected_sheet_name: str | None = None
+                    skip_rows = int(
+                        st.number_input(
+                            "Rows to skip before header",
                             min_value=0,
-                            max_value=100,
-                            value=0,
-                            key=f"skip_{filename}",
-                            help="Number of rows to skip before the header row"
+                            max_value=500,
+                            value=_normalize_skip_rows(prev_custom_meta.get("skip_rows", 0)),
+                            step=1,
+                            key=f"custom_skip_{file_key}",
                         )
-                    
-                    # Parse button
-                    if st.button(f"Load Preview", key=f"parse_{filename}"):
-                        try:
-                            with st.spinner("Parsing file..."):
-                                df = parse_file(
-                                    filename,
-                                    file_info['content'],
-                                    file_type=file_info['type'],
-                                    sheet_name=sheet_name,
-                                    skip_rows=skip_rows
-                                )
-                                st.session_state.upload_files[filename]['df'] = df
-                                st.session_state.upload_files[filename]['sheet_name'] = sheet_name
-                                st.session_state.upload_files[filename]['skip_rows'] = skip_rows
-                                st.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
-                        except Exception as e:
-                            st.error(f"Error parsing file: {e}")
-                
-                with col2:
-                    if st.button("🗑️ Remove", key=f"remove_{filename}"):
-                        del st.session_state.upload_files[filename]
-                        st.rerun()
-                
-                # Show preview if parsed
-                if file_info.get('df') is not None:
-                    df = file_info['df']
-                    st.markdown(f"**Preview** (first 50 rows of {len(df):,} total)")
-                    st.dataframe(df.head(50), use_container_width=True, height=300)
-        
-        # Navigation
-        st.markdown("---")
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col3:
-            # Can proceed if we have files and a dataset ID (preview is optional here)
-            has_files = len(st.session_state.upload_files) > 0
-            can_proceed = has_files and st.session_state.dataset_id
-            
-            def go_to_step_2():
-                st.session_state.current_step = 2
-            
-            st.button(
-                "Next: Configure Columns →", 
-                type="primary", 
-                use_container_width=True,
-                disabled=not can_proceed,
-                on_click=go_to_step_2 if can_proceed else None
-            )
-            
-            if not st.session_state.dataset_id:
-                st.caption("⚠️ Enter a Dataset ID")
-            if not has_files:
-                st.caption("⚠️ Upload at least one file or connect an API")
-    
-    # API Source Section (when API tab is selected)
-    if source_tab == "🌐 Connect API":
-        render_api_source_section()
-
-
-def render_api_source_section():
-    """Render the API source connection section."""
-    from ingestion.api_connectors import (
-        CensusACSConnector, HUDConnector, CENSUS_PRESETS, US_STATES,
-        list_census_presets, get_connector
-    )
-    
-    st.markdown("### Connect to API Data Source")
-    
-    # API Type Selection
-    api_type = st.selectbox(
-        "Select API type",
-        options=["census_acs", "hud", "custom"],
-        format_func=lambda x: {
-            "census_acs": "🇺🇸 US Census ACS (American Community Survey)",
-            "hud": "🏠 HUD (Fair Market Rents, Income Limits)",
-            "custom": "🔧 Custom API (Advanced)"
-        }.get(x, x),
-        key="api_type_select"
-    )
-    
-    if api_type == "census_acs":
-        st.info("""
-        **Census ACS** provides demographic, social, economic, and housing data 
-        for ZIP Code Tabulation Areas (ZCTAs) across the United States.
-        """)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Year selection
-            year = st.selectbox(
-                "Data Year",
-                options=list(range(2022, 2014, -1)),
-                index=0,
-                help="Select the ACS 5-year data release year"
-            )
-        
-        with col2:
-            # API Key (optional)
-            api_key = st.text_input(
-                "Census API Key (optional)",
-                type="password",
-                help="Get a free key at api.census.gov. Optional but recommended for heavy usage."
-            )
-        
-        # Preset selection
-        st.markdown("#### Select Data Category")
-        presets = list_census_presets()
-        
-        preset_cols = st.columns(3)
-        selected_presets = []
-        
-        for i, preset in enumerate(presets):
-            col_idx = i % 3
-            with preset_cols[col_idx]:
-                if st.checkbox(
-                    f"**{preset['name']}**",
-                    key=f"preset_{preset['id']}",
-                    help=preset['description']
-                ):
-                    selected_presets.append(preset['id'])
-        
-        # Fetch button
-        st.markdown("---")
-        
-        if selected_presets:
-            st.success(f"Selected: {', '.join(selected_presets)}")
-            
-            if st.button("🔄 Fetch Data from Census", type="primary"):
-                connector = CensusACSConnector(api_key=api_key if api_key else None)
-                
-                for preset_id in selected_presets:
-                    preset_info = CENSUS_PRESETS.get(preset_id, {})
-                    with st.spinner(f"Fetching {preset_info.get('name', preset_id)}..."):
-                        try:
-                            df, metadata = connector.fetch(
-                                year=year,
-                                preset=preset_id,
-                                api_key=api_key if api_key else None
-                            )
-                            
-                            # Store as if it were an uploaded file
-                            source_name = f"census_{preset_id}_{year}.csv"
-                            st.session_state.upload_files[source_name] = {
-                                'content': df.to_csv(index=False).encode('utf-8'),
-                                'type': 'csv',
-                                'df': df,
-                                'from_api': True,
-                                'api_metadata': metadata
-                            }
-                            
-                            st.success(f"✓ {preset_info.get('name', preset_id)}: {len(df):,} rows")
-                            
-                            # Show preview
-                            with st.expander(f"Preview: {source_name}"):
-                                st.dataframe(df.head(10), use_container_width=True)
-                                
-                        except Exception as e:
-                            st.error(f"Failed to fetch {preset_id}: {e}")
-        else:
-            st.warning("Select at least one data category to fetch")
-    
-    elif api_type == "hud":
-        st.info("""
-        **HUD API** provides housing data including Fair Market Rents and Income Limits.
-        
-        ⚠️ **Requires free API token:** [Register here](https://www.huduser.gov/hudapi/public/register)
-        """)
-        
-        # API Token (required)
-        hud_token = st.text_input(
-            "HUD API Token (required)",
-            type="password",
-            help="Get a free token at huduser.gov/hudapi/public/register"
-        )
-        
-        if not hud_token:
-            st.warning("⚠️ HUD API token is required. Register for free at the link above.")
-        else:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                hud_dataset = st.selectbox(
-                    "Dataset",
-                    options=["fmr", "il"],
-                    format_func=lambda x: {
-                        "fmr": "Fair Market Rents",
-                        "il": "Income Limits"
-                    }.get(x, x),
-                    help="FMR: Rental housing costs | IL: Income thresholds for housing programs"
-                )
-                
-                hud_year = st.selectbox(
-                    "Fiscal Year",
-                    options=list(range(2024, 2018, -1)),
-                    index=0
-                )
-            
-            with col2:
-                # State selection
-                state_options = list(US_STATES.keys())
-                selected_states = st.multiselect(
-                    "Select States",
-                    options=state_options,
-                    default=["CA"],
-                    format_func=lambda x: f"{x} - {US_STATES.get(x, x)}",
-                    help="Select one or more states to fetch data for"
-                )
-            
-            if selected_states:
-                st.info(f"Will fetch {hud_dataset.upper()} data for: {', '.join(selected_states)}")
-                
-                if st.button("🔄 Fetch HUD Data", type="primary"):
-                    connector = HUDConnector(api_token=hud_token)
-                    
-                    with st.spinner(f"Fetching HUD {hud_dataset.upper()} data for {len(selected_states)} state(s)..."):
-                        try:
-                            df, metadata = connector.fetch(
-                                api_token=hud_token,
-                                dataset=hud_dataset,
-                                year=hud_year,
-                                states=selected_states
-                            )
-                            
-                            # Store as data source
-                            source_name = f"hud_{hud_dataset}_{hud_year}_{'_'.join(selected_states)}.csv"
-                            st.session_state.upload_files[source_name] = {
-                                'content': df.to_csv(index=False).encode('utf-8'),
-                                'type': 'csv',
-                                'df': df,
-                                'from_api': True,
-                                'api_metadata': metadata
-                            }
-                            
-                            st.success(f"✓ Fetched {len(df):,} records")
-                            
-                            # Show preview
-                            with st.expander(f"Preview: {source_name}", expanded=True):
-                                st.write(f"**Columns:** {', '.join(df.columns[:10])}{'...' if len(df.columns) > 10 else ''}")
-                                st.dataframe(df.head(20), use_container_width=True)
-                                
-                            if metadata.get("errors"):
-                                st.warning(f"Some states had errors: {metadata['errors']}")
-                                
-                        except Exception as e:
-                            st.error(f"Failed to fetch HUD data: {e}")
-            else:
-                st.warning("Select at least one state")
-    
-    elif api_type == "custom":
-        st.warning("""
-        **Custom API** allows connecting to any REST API that returns JSON data.
-        This is an advanced feature for integrations like McKesson or other data providers.
-        """)
-        
-        url = st.text_input(
-            "API URL",
-            placeholder="https://api.example.com/data",
-            help="The endpoint URL to fetch data from"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            method = st.selectbox("HTTP Method", ["GET", "POST"])
-            auth_type = st.selectbox(
-                "Authentication",
-                ["none", "api_key_header", "api_key_param", "bearer"]
-            )
-        
-        with col2:
-            if auth_type != "none":
-                auth_key = st.text_input("API Key/Token", type="password")
-            else:
-                auth_key = None
-            
-            zip_column = st.text_input(
-                "ZIP Code Column",
-                value="zip",
-                help="Name of the column containing ZIP codes in the API response"
-            )
-        
-        data_path = st.text_input(
-            "JSON Data Path (optional)",
-            placeholder="results.data",
-            help="Dot-notation path to the data array in the JSON response"
-        )
-        
-        if url:
-            if st.button("🔄 Fetch Data", type="primary"):
-                try:
-                    connector = get_connector("custom")
-                    with st.spinner("Fetching data..."):
-                        df, metadata = connector.fetch(
-                            url=url,
-                            method=method,
-                            auth_type=auth_type,
-                            auth_key=auth_key,
-                            data_path=data_path,
-                            zip_column=zip_column
-                        )
-                        
-                        # Store as if it were an uploaded file
-                        source_name = f"api_custom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                        st.session_state.upload_files[source_name] = {
-                            'content': df.to_csv(index=False).encode('utf-8'),
-                            'type': 'csv',
-                            'df': df,
-                            'from_api': True,
-                            'api_metadata': metadata
-                        }
-                        
-                        st.success(f"✓ Fetched {len(df):,} rows")
-                        st.dataframe(df.head(10), use_container_width=True)
-                        
-                except Exception as e:
-                    st.error(f"Failed to fetch: {e}")
-    
-    # Show all sources (files + API)
-    if st.session_state.upload_files:
-        st.markdown("---")
-        st.markdown("### All Data Sources")
-        for name, info in st.session_state.upload_files.items():
-            source_type = "🌐 API" if info.get('from_api') else "📄 File"
-            row_count = len(info['df']) if info.get('df') is not None else "?"
-            st.write(f"- {source_type} **{name}** ({row_count} rows)")
-
-
-def render_column_config_section():
-    """Render the column configuration section (Step 2)."""
-    st.header("⚙️ Step 2: Configure Columns")
-    
-    # Initialize file_configs for any files that don't have it
-    for filename in st.session_state.upload_files:
-        if filename not in st.session_state.file_configs:
-            st.session_state.file_configs[filename] = {
-                'zip_column': '',
-                'norm_mode': 'already_5_digit',
-                'features': [],
-                'renames': {}
-            }
-    
-    # Auto-load previews for files that haven't been parsed yet
-    files_to_parse = []
-    for filename, file_info in st.session_state.upload_files.items():
-        if file_info.get('df') is None:
-            files_to_parse.append(filename)
-    
-    if files_to_parse:
-        with st.spinner(f"Loading {len(files_to_parse)} file(s)..."):
-            for filename in files_to_parse:
-                file_info = st.session_state.upload_files[filename]
-                try:
-                    df = parse_file(
-                        filename,
-                        file_info['content'],
-                        file_type=file_info['type'],
-                        sheet_name=file_info.get('sheet_name'),
-                        skip_rows=file_info.get('skip_rows', 0)
                     )
-                    st.session_state.upload_files[filename]['df'] = df
-                except Exception as e:
-                    st.error(f"Failed to parse {filename}: {e}")
-    
-    for filename, file_info in st.session_state.upload_files.items():
-        if file_info.get('df') is None:
-            st.warning(f"Could not load {filename}. Please go back and configure parsing options.")
-            continue
-        
-        df = file_info['df']
-        current_config = st.session_state.file_configs.get(filename, {})
-        
-        with st.expander(f"📄 {filename}", expanded=True):
-            # Data Preview at the top
-            st.markdown(f"**Data Preview** ({len(df):,} rows × {len(df.columns)} columns)")
-            st.dataframe(df.head(30), use_container_width=True, height=200)
-            
-            st.markdown("---")
-            st.markdown(f"**Available Columns ({len(df.columns)}):** `{', '.join(df.columns)}`")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # ZIP column selection
-                detected_zip = detect_zip_column(df)
-                default_zip = current_config.get('zip_column') or (detected_zip if detected_zip in df.columns else '')
-                
-                zip_options = [''] + list(df.columns)
-                zip_index = zip_options.index(default_zip) if default_zip in zip_options else 0
-                
-                zip_column = st.selectbox(
-                    "ZIP/ZCTA Column *",
-                    options=zip_options,
-                    index=zip_index,
-                    key=f"zip_col_{filename}",
-                    help="Select the column containing ZIP codes"
-                )
-                
-                # Show sample values
-                if zip_column:
-                    sample_values = df[zip_column].dropna().head(5).tolist()
-                    st.caption(f"Sample values: {sample_values}")
-            
-            with col2:
-                # Normalization mode
-                suggested_mode = suggest_normalization_mode(df, zip_column) if zip_column else "already_5_digit"
-                default_mode = current_config.get('norm_mode', suggested_mode)
-                mode_options = list(NORMALIZATION_MODES.keys())
-                mode_index = mode_options.index(default_mode) if default_mode in mode_options else 0
-                
-                norm_mode = st.selectbox(
-                    "ZIP Normalization Mode",
-                    options=mode_options,
-                    index=mode_index,
-                    key=f"norm_mode_{filename}",
-                    help="""
-                    - **already_5_digit**: Values are already 5-digit ZIPs (handles leading zeros)
-                    - **extract_5_digit_regex**: Extract ZIP from longer strings
-                    - **zip_plus_4**: Handle ZIP+4 format (12345-6789)
-                    """
-                )
-                
-                # Preview normalization
-                if zip_column and st.button("Preview Normalization", key=f"preview_norm_{filename}"):
-                    normalized = normalize_zip_column(df, zip_column, norm_mode)
-                    preview_df = pd.DataFrame({
-                        'Original': df[zip_column].head(10),
-                        'Normalized': normalized.head(10)
-                    })
-                    st.dataframe(preview_df)
-            
-            st.markdown("---")
-            
-            # Feature column selection
-            st.markdown("**Select Feature Columns** *")
-            
-            # Multi-select for features (exclude ZIP column)
-            non_zip_cols = [c for c in df.columns if c != zip_column]
-            default_features = [f for f in current_config.get('features', []) if f in non_zip_cols]
-            
-            # Select All / Clear All buttons
-            feat_col1, feat_col2, feat_col3 = st.columns([1, 1, 2])
-            with feat_col1:
-                if st.button("Select All", key=f"select_all_{filename}", use_container_width=True):
-                    st.session_state[f"features_{filename}"] = non_zip_cols
-                    st.rerun()
-            with feat_col2:
-                if st.button("Clear All", key=f"clear_all_{filename}", use_container_width=True):
-                    st.session_state[f"features_{filename}"] = []
-                    st.rerun()
-            
-            selected_features = st.multiselect(
-                "Features to include",
-                options=non_zip_cols,
-                default=default_features,
-                key=f"features_{filename}",
-                help="Select columns you want to use as features in the dataset"
-            )
-            
-            # Column renaming
-            renames = {}
-            if selected_features:
-                st.markdown("**Rename Columns (optional)**")
-                
-                num_cols = min(3, len(selected_features))
-                rename_cols = st.columns(num_cols)
-                
-                for i, col in enumerate(selected_features):
-                    with rename_cols[i % num_cols]:
-                        # Get previous rename if exists
-                        prev_rename = current_config.get('renames', {}).get(col, col)
-                        new_name = st.text_input(
-                            f"'{col}' →",
-                            value=prev_rename,
-                            key=f"rename_{filename}_{col}"
+
+                    cf.seek(0)
+                    if ext in (".xlsx", ".xlsm", ".xls"):
+                        excel_file = pd.ExcelFile(cf)
+                        sheet_options = excel_file.sheet_names
+                        default_sheet = prev_custom_meta.get("sheet_name")
+                        if default_sheet not in sheet_options:
+                            default_sheet = next(
+                                (s for s in sheet_options if "health" in s.lower()),
+                                sheet_options[0] if sheet_options else None,
+                            )
+                        if sheet_options:
+                            selected_sheet_name = st.selectbox(
+                                "Worksheet",
+                                options=sheet_options,
+                                index=sheet_options.index(default_sheet) if default_sheet in sheet_options else 0,
+                                key=f"custom_sheet_{file_key}",
+                            )
+                        preview_df = pd.read_excel(
+                            excel_file,
+                            sheet_name=selected_sheet_name if selected_sheet_name else 0,
+                            skiprows=skip_rows,
                         )
-                        if new_name and new_name != col:
-                            renames[col] = new_name
-                
-                if renames:
-                    st.info(f"Column renames: {renames}")
-            
-            # Store config immediately on any change
-            st.session_state.file_configs[filename] = {
-                'zip_column': zip_column,
-                'norm_mode': norm_mode,
-                'features': selected_features,
-                'renames': renames
-            }
-            
-            # Show current config status
-            if zip_column and selected_features:
-                st.success(f"✓ Configured: {len(selected_features)} features selected")
-            else:
-                missing = []
-                if not zip_column:
-                    missing.append("ZIP column")
-                if not selected_features:
-                    missing.append("feature columns")
-                st.warning(f"⚠️ Please select: {', '.join(missing)}")
-    
-    # Navigation
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    
-    def go_to_step_1():
-        st.session_state.current_step = 1
-    
-    def go_to_step_3():
-        st.session_state.current_step = 3
-    
-    with col1:
-        st.button("← Back to Upload", use_container_width=True, on_click=go_to_step_1)
-    
-    with col3:
-        # Validate configs
-        all_valid = all(
-            cfg.get('zip_column') and cfg.get('features')
-            for cfg in st.session_state.file_configs.values()
-            if cfg  # Skip empty configs
-        )
-        can_proceed = all_valid and st.session_state.file_configs
-        
-        st.button(
-            "Next: Cleaning Rules →", 
-            type="primary", 
-            use_container_width=True,
-            disabled=not can_proceed,
-            on_click=go_to_step_3 if can_proceed else None
-        )
-        
-        if not can_proceed:
-            st.caption("⚠️ Select ZIP column and features for all files")
+                    else:
+                        preview_df = pd.read_csv(cf, skiprows=skip_rows)
+                    preview_df.columns = [str(c).strip() for c in preview_df.columns]
 
+                    if preview_df.empty:
+                        st.warning("No rows found after applying skip rows.")
+                        continue
 
-def render_cleaning_rules_section():
-    """Render the cleaning rules section (Step 3)."""
-    st.header("🧹 Step 3: Cleaning Rules")
-    
-    for filename, file_info in st.session_state.upload_files.items():
-        if file_info.get('df') is None:
-            continue
-        
-        df = file_info['df']
-        file_config = st.session_state.file_configs.get(filename, {})
-        features = file_config.get('features', [])
-        
-        with st.expander(f"📄 {filename}", expanded=True):
-            st.markdown("**Drop rows where selected columns are NULL:**")
-            
-            all_cols = [file_config.get('zip_column')] + features
-            all_cols = [c for c in all_cols if c]
-            
-            drop_null_cols = st.multiselect(
-                "Columns for NULL check",
-                options=all_cols,
-                default=[file_config.get('zip_column')] if file_config.get('zip_column') else [],
-                key=f"drop_null_{filename}",
-                help="Rows with NULL values in these columns will be dropped"
-            )
-            
-            # Show impact preview
-            if drop_null_cols:
-                null_counts = df[drop_null_cols].isnull().any(axis=1).sum()
-                st.caption(f"This will drop {null_counts:,} rows with NULL values")
-            
-            # Store cleaning rules
-            if 'cleaning_rules' not in st.session_state.file_configs[filename]:
-                st.session_state.file_configs[filename]['cleaning_rules'] = {}
-            st.session_state.file_configs[filename]['cleaning_rules']['drop_null_columns'] = drop_null_cols
-    
-    # Navigation
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    
-    def go_to_step_2():
-        st.session_state.current_step = 2
-    
-    def go_to_step_4():
-        st.session_state.current_step = 4
-    
-    with col1:
-        st.button("← Back to Columns", use_container_width=True, on_click=go_to_step_2)
-    with col3:
-        st.button("Next: Scoring Config →", type="primary", use_container_width=True, on_click=go_to_step_4)
+                    st.dataframe(preview_df.head(10), use_container_width=True, height=150)
 
+                    # Auto-detect ZIP column, preferring prior selection if present
+                    zip_candidates = [""] + list(preview_df.columns)
+                    auto_zip = prev_custom_meta.get("zip_col", "")
+                    if auto_zip not in preview_df.columns:
+                        auto_zip = ""
+                    if not auto_zip:
+                        for candidate in ["zip", "ZIP", "Zip", "ZCTA5", "zcta5", "ZCTA", "Zipcode", "zipcode"]:
+                            if candidate in preview_df.columns:
+                                auto_zip = candidate
+                                break
+                    if not auto_zip:
+                        for c in preview_df.columns:
+                            if "zip" in c.lower() or "zcta" in c.lower():
+                                auto_zip = c
+                                break
 
-def render_scoring_config_section():
-    """Render the scoring configuration section (Step 4)."""
-    st.header("🎯 Step 4: Scoring Component Mapping")
-    
-    st.markdown("""
-    Map your data columns to **scoring components**. The scoring model uses these 
-    mappings to calculate the pharmacy desert score for each ZIP code.
-    
-    **All components are optional** - map whatever data you have available.
-    The model will use whatever components are mapped and ignore the rest.
-    """)
-    
-    # Collect all available columns across all files (with renames applied)
-    available_columns = []
-    for filename, file_config in st.session_state.file_configs.items():
-        features = file_config.get('features', [])
-        renames = file_config.get('renames', {})
-        
-        for col in features:
-            # Use renamed name if exists
-            display_name = renames.get(col, col)
-            available_columns.append({
-                'column': display_name,
-                'original': col,
-                'file': filename
-            })
-    
-    # Also add 'zcta5' as the normalized ZIP column (always available)
-    column_options = ['(not mapped)'] + [c['column'] for c in available_columns]
-    
-    if not available_columns:
-        st.warning("No feature columns available. Go back and select features in Step 2.")
-        
-        def go_to_step_2():
-            st.session_state.current_step = 2
-        st.button("← Back to Columns", on_click=go_to_step_2)
-        return
-    
-    # Show available columns
-    with st.expander("📋 Available Columns from Your Data", expanded=False):
-        cols_df = pd.DataFrame(available_columns)
-        st.dataframe(cols_df, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # All components by category (nothing is required)
-    st.markdown("### Available Scoring Components")
-    st.markdown("*Map your columns to include them in the scoring model.*")
-    
-    # Organize all components by category
-    components_by_category = {}
-    for comp_name in SCORED_COMPONENTS:
-        comp = SCORING_COMPONENTS[comp_name]
-        cat = comp.category
-        if cat not in components_by_category:
-            components_by_category[cat] = []
-        components_by_category[cat].append((comp_name, comp))
-    
-    for category, components in components_by_category.items():
-        category_label = COMPONENT_CATEGORIES.get(category, category.title())
-        
-        with st.expander(f"**{category_label}** ({len(components)} components)", expanded=False):
-            opt_cols = st.columns(2)
-            for i, (comp_name, comp) in enumerate(components):
-                with opt_cols[i % 2]:
-                    current = st.session_state.scoring_mappings.get(comp_name, '(not mapped)')
-                    default_idx = column_options.index(current) if current in column_options else 0
-                    
-                    direction_icon = "📈" if comp.direction == ScoreDirection.HIGHER_IS_WORSE else "📉"
-                    
-                    selected = st.selectbox(
-                        f"{direction_icon} {comp.display_name}",
-                        options=column_options,
+                    default_idx = zip_candidates.index(auto_zip) if auto_zip in zip_candidates else 0
+                    zip_col = st.selectbox(
+                        "ZIP / ZCTA column",
+                        options=zip_candidates,
                         index=default_idx,
-                        key=f"score_map_{comp_name}",
-                        help=f"{comp.description}\n\nDefault weight: {comp.default_weight:.0%}"
+                        key=f"custom_zip_{file_key}",
                     )
-                    
-                    if selected != '(not mapped)':
-                        st.session_state.scoring_mappings[comp_name] = selected
-                    elif comp_name in st.session_state.scoring_mappings:
-                        del st.session_state.scoring_mappings[comp_name]
-    
-    st.markdown("---")
-    
-    # Weight customization (optional)
-    with st.expander("⚖️ Customize Default Weights (Advanced)", expanded=False):
-        st.markdown("""
-        Adjust the default weights for scoring components. These can also be 
-        adjusted in the main app using the sidebar sliders.
-        """)
-        
-        for comp_name in st.session_state.scoring_mappings:
-            if comp_name in SCORING_COMPONENTS:
-                comp = SCORING_COMPONENTS[comp_name]
-                if comp.default_weight > 0:
-                    current_weight = st.session_state.weight_overrides.get(
-                        comp_name, comp.default_weight
-                    )
-                    new_weight = st.slider(
-                        f"{comp.display_name} weight",
-                        0.0, 1.0, current_weight, 0.05,
-                        key=f"weight_{comp_name}"
-                    )
-                    if new_weight != comp.default_weight:
-                        st.session_state.weight_overrides[comp_name] = new_weight
-    
-    # Summary of mappings
-    st.markdown("---")
-    st.markdown("### Mapping Summary")
-    
-    if st.session_state.scoring_mappings:
-        mapping_data = []
-        for comp_name, col_name in st.session_state.scoring_mappings.items():
-            comp = SCORING_COMPONENTS.get(comp_name)
-            if comp:
-                mapping_data.append({
-                    'Component': comp.display_name,
-                    'Your Column': col_name,
-                    'Direction': '↑ = worse' if comp.direction == ScoreDirection.HIGHER_IS_WORSE else '↑ = better',
-                    'Weight': f"{st.session_state.weight_overrides.get(comp_name, comp.default_weight):.0%}"
-                })
-        
-        st.dataframe(pd.DataFrame(mapping_data), use_container_width=True, hide_index=True)
-    else:
-        st.info("No mappings configured yet.")
-    
-    # Navigation
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    
-    def go_to_step_3():
-        st.session_state.current_step = 3
-    
-    def go_to_step_5():
-        st.session_state.current_step = 5
-    
-    with col1:
-        st.button("← Back to Cleaning", use_container_width=True, on_click=go_to_step_3)
-    
-    with col3:
-        # No validation required - all components are optional
-        mapped_count = len(st.session_state.scoring_mappings)
-        st.button(
-            "Next: Review & Submit →", 
-            type="primary", 
-            use_container_width=True,
-            on_click=go_to_step_5
-        )
-        
-        if mapped_count == 0:
-            st.caption("💡 No mappings yet - you can still proceed")
-        else:
-            st.caption(f"✓ {mapped_count} component(s) mapped")
 
-
-def render_review_submit_section():
-    """Render the review and submit section (Step 5)."""
-    st.header("✅ Step 5: Review & Submit")
-    
-    # Summary
-    st.markdown("### Configuration Summary")
-    
-    st.markdown(f"**Dataset ID:** `{st.session_state.dataset_id}`")
-    version_id = generate_version_id()
-    st.markdown(f"**Version ID:** `{version_id}`")
-    if st.session_state.version_description:
-        st.markdown(f"**Description:** {st.session_state.version_description}")
-    
-    # File summaries
-    sources = []
-    for filename, file_info in st.session_state.upload_files.items():
-        if file_info.get('df') is None:
-            continue
-        
-        df = file_info['df']
-        file_config = st.session_state.file_configs.get(filename, {})
-        
-        with st.expander(f"📄 {filename}", expanded=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**Rows:** {len(df):,}")
-                st.markdown(f"**ZIP Column:** `{file_config.get('zip_column')}`")
-                st.markdown(f"**Normalization:** `{file_config.get('norm_mode')}`")
-            with col2:
-                st.markdown(f"**Features:** {len(file_config.get('features', []))}")
-                st.markdown(f"**Renames:** {len(file_config.get('renames', {}))}")
-                drop_cols = file_config.get('cleaning_rules', {}).get('drop_null_columns', [])
-                st.markdown(f"**NULL check columns:** {len(drop_cols)}")
-        
-        # Build mapping for this file
-        mapping = build_file_mapping(
-            filename=filename,
-            file_type=file_info['type'],
-            zip_column=file_config.get('zip_column', ''),
-            normalization_mode=file_config.get('norm_mode', 'already_5_digit'),
-            feature_columns=file_config.get('features', []),
-            column_renames=file_config.get('renames', {}),
-            cleaning_rules=file_config.get('cleaning_rules', {}),
-            sheet_name=file_info.get('sheet_name'),
-            skip_rows=file_info.get('skip_rows', 0)
-        )
-        sources.append(mapping)
-    
-    # Scoring config summary
-    st.markdown("### Scoring Configuration")
-    
-    if st.session_state.scoring_mappings:
-        mapping_count = len(st.session_state.scoring_mappings)
-        required_count = len([c for c in st.session_state.scoring_mappings if c in REQUIRED_COMPONENTS])
-        optional_count = mapping_count - required_count
-        
-        st.markdown(f"**Mapped components:** {mapping_count} ({required_count} required, {optional_count} optional)")
-        
-        # Build scoring config for storage
-        scoring_config = ScoringConfig(
-            column_mappings=[
-                ColumnMapping(source_column=col, target_component=comp)
-                for comp, col in st.session_state.scoring_mappings.items()
-            ],
-            weight_overrides=st.session_state.weight_overrides
-        )
-        
-        with st.expander("View Scoring Configuration JSON"):
-            st.json(scoring_config.to_dict())
-    else:
-        st.warning("No scoring configuration! The dataset won't have model mappings.")
-        scoring_config = None
-    
-    # Submit button
-    st.markdown("---")
-    
-    def go_to_step_4():
-        st.session_state.current_step = 4
-    
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col1:
-        st.button("← Back to Scoring", use_container_width=True, on_click=go_to_step_4)
-    
-    with col3:
-        if st.button("🚀 Upload Dataset", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Uploading to storage..."):
-                    storage = get_storage()
-                    dataset_id = st.session_state.dataset_id
-                    
-                    progress = st.progress(0)
-                    status = st.empty()
-                    
-                    total_files = len(st.session_state.upload_files)
-                    uploaded_paths = []
-                    
-                    # Upload files and mappings
-                    for i, (filename, file_info) in enumerate(st.session_state.upload_files.items()):
-                        if file_info.get('df') is None:
-                            continue
-                        
-                        status.text(f"Uploading {filename}...")
-                        
-                        # Upload original file
-                        file_path = storage.upload_file(
-                            dataset_id, version_id, filename, file_info['content']
-                        )
-                        uploaded_paths.append(file_path)
-                        
-                        # Upload mapping
-                        file_config = st.session_state.file_configs.get(filename, {})
-                        mapping = build_file_mapping(
-                            filename=filename,
-                            file_type=file_info['type'],
-                            zip_column=file_config.get('zip_column', ''),
-                            normalization_mode=file_config.get('norm_mode', 'already_5_digit'),
-                            feature_columns=file_config.get('features', []),
-                            column_renames=file_config.get('renames', {}),
-                            cleaning_rules=file_config.get('cleaning_rules', {}),
-                            sheet_name=file_info.get('sheet_name'),
-                            skip_rows=file_info.get('skip_rows', 0)
-                        )
-                        storage.upload_mapping(dataset_id, version_id, filename, mapping)
-                        
-                        progress.progress((i + 1) / (total_files + 2))
-                    
-                    # Upload dataset config (includes scoring config)
-                    status.text("Uploading dataset configuration...")
-                    dataset_config = build_dataset_config(
-                        dataset_id=dataset_id,
-                        version_id=version_id,
-                        sources=sources
+                    zip_mode_options = list(ZIP_NORMALIZATION_LABELS.keys())
+                    default_zip_mode = prev_custom_meta.get(
+                        "zip_normalization_mode", "extract_5_digit_regex"
                     )
-                    
-                    # Add version description
-                    if st.session_state.version_description:
-                        dataset_config['description'] = st.session_state.version_description
-                    
-                    # Add scoring config to dataset config
-                    if scoring_config:
-                        dataset_config['scoring_config'] = scoring_config.to_dict()
-                    
-                    storage.upload_config(dataset_id, version_id, dataset_config)
-                    progress.progress((total_files + 1) / (total_files + 2))
-                    
-                    # Update LATEST.json
-                    status.text("Updating LATEST pointer...")
-                    storage.update_latest(dataset_id, version_id)
-                    
-                    progress.progress(1.0)
-                    status.empty()
-                    
-                st.success(f"""
-                ✅ **Dataset uploaded successfully!**
-                
-                - **Dataset ID:** `{dataset_id}`
-                - **Version ID:** `{version_id}`
-                - **Files uploaded:** {len(uploaded_paths)}
-                - **Scoring components:** {len(st.session_state.scoring_mappings)}
-                """)
-                
-                # Auto-trigger model training
-                st.markdown("---")
-                st.markdown("### 🤖 Model Training")
-                
-                train_automatically = st.checkbox(
-                    "Automatically train model with new data",
-                    value=True,
-                    help="Triggers the ML training pipeline with the uploaded data"
-                )
-                
-                if train_automatically:
-                    try:
-                        with st.spinner("Training model with new data..."):
-                            from training.orchestrator import trigger_training
-                            model_version = trigger_training(
-                                dataset_id=dataset_id,
-                                dataset_version=version_id
+                    if default_zip_mode not in zip_mode_options:
+                        default_zip_mode = "extract_5_digit_regex"
+                    zip_normalization_mode = st.selectbox(
+                        "ZIP normalization strategy",
+                        options=zip_mode_options,
+                        index=zip_mode_options.index(default_zip_mode),
+                        key=f"custom_zip_mode_{file_key}",
+                        format_func=_zip_mode_label,
+                    )
+
+                    if zip_col:
+                        normalized_zips = _normalize_zip_series(
+                            preview_df[zip_col],
+                            mode=zip_normalization_mode,
+                        )
+                        valid_count = int(normalized_zips.notna().sum())
+                        total_count = len(preview_df)
+                        source_sample = preview_df[zip_col].dropna().head(5).tolist()
+                        normalized_sample = normalized_zips.dropna().head(5).tolist()
+                        st.caption(f"Sample source ZIP values: {source_sample}")
+                        st.caption(f"Sample normalized ZIP values: {normalized_sample}")
+
+                        zip_preview = pd.DataFrame(
+                            {
+                                "source_zip": preview_df[zip_col].head(8).astype(str),
+                                "normalized_zip": normalized_zips.head(8),
+                            }
+                        )
+                        st.dataframe(zip_preview, use_container_width=True, height=180)
+
+                        if valid_count == 0:
+                            st.error(
+                                f"No valid ZIPs found in '{zip_col}' with mode "
+                                f"'{_zip_mode_label(zip_normalization_mode)}'."
                             )
-                            
-                        if model_version:
-                            st.success(f"""
-                            🎉 **Model trained successfully!**
-                            
-                            - **Model Version:** `{model_version}`
-                            - **Based on:** Dataset `{dataset_id}` v`{version_id}`
-                            """)
+                            continue
+                        elif valid_count < total_count * 0.5:
+                            st.warning(
+                                f"Only {valid_count:,}/{total_count:,} rows have a valid ZIP "
+                                "with current normalization."
+                            )
                         else:
-                            st.warning("Training completed but no model version returned. Check logs.")
-                            
-                    except Exception as train_error:
-                        st.warning(f"""
-                        ⚠️ **Training not available yet**
-                        
-                        The training script needs to be adapted for automated training.
-                        Your ML partner can:
-                        1. Check `training/orchestrator.py` for the integration points
-                        2. Adapt `new_training.py` to read from TRAINING_CONFIG env var
-                        
-                        Error: {train_error}
-                        """)
-                else:
-                    st.info("""
-                    💡 **Manual training:** Your ML partner can train the model using:
-                    ```bash
-                    python new_training.py
-                    ```
-                    Or trigger training programmatically:
-                    ```python
-                    from training.orchestrator import trigger_training
-                    trigger_training(dataset_id="{dataset_id}", dataset_version="{version_id}")
-                    ```
-                    """)
-                
-                # Show paths
-                with st.expander("📂 Uploaded paths"):
-                    for path in uploaded_paths:
-                        st.code(path)
-                
-                # Reset button
-                def reset_wizard():
-                    st.session_state.upload_files = {}
-                    st.session_state.file_configs = {}
-                    st.session_state.dataset_id = ""
-                    st.session_state.current_step = 1
-                    st.session_state.scoring_mappings = {}
-                    st.session_state.weight_overrides = {}
-                    st.session_state.version_description = ""
-                
-                st.button("📤 Upload Another Dataset", on_click=reset_wizard)
-                    
-            except Exception as e:
-                st.error(f"❌ Upload failed: {e}")
-                import traceback
+                            st.caption(f"ZIP coverage: {valid_count:,}/{total_count:,} rows")
+
+                        feature_cols = [c for c in preview_df.columns if c != zip_col]
+                        numeric_feature_cols = [
+                            c
+                            for c in feature_cols
+                            if _coerce_numeric_like_series(preview_df[c].head(5000))[1]
+                        ]
+                        st.caption(
+                            f"Available columns ({len(feature_cols)}): {', '.join(feature_cols[:10])}"
+                            + ("…" if len(feature_cols) > 10 else "")
+                        )
+                        st.caption(
+                            f"Numeric columns detected: {len(numeric_feature_cols)} "
+                            f"(useful for scoring/weighting if you include them)"
+                        )
+
+                        selected_default = prev_custom_meta.get("selected_columns") or feature_cols
+                        if not prev_custom_meta.get("selected_columns"):
+                            revenue_cols = [
+                                c
+                                for c in feature_cols
+                                if _is_revenue_potential_column(c) or _is_revenue_without_insurance_column(c)
+                            ]
+                            if not revenue_cols:
+                                revenue_cols = [c for c in feature_cols if _is_revenue_metric_column(c)]
+                            if revenue_cols:
+                                selected_default = revenue_cols
+                        selected_default = [c for c in selected_default if c in feature_cols]
+                        if not selected_default:
+                            selected_default = feature_cols
+
+                        selected_columns = st.multiselect(
+                            "Columns to include in merged dataset",
+                            options=feature_cols,
+                            default=selected_default,
+                            key=f"custom_cols_{file_key}",
+                            help="Only selected columns will be merged into the unified dataset.",
+                        )
+                        if any(_is_revenue_metric_column(c) for c in selected_columns):
+                            st.caption(
+                                "Revenue column(s) detected. They will be merged by ZIP and "
+                                "available in scoring and map/table outputs."
+                            )
+
+                        naming_options = ["auto_shorten", "keep_original", "custom_edit"]
+                        default_naming_strategy = prev_custom_meta.get("naming_strategy", "auto_shorten")
+                        if default_naming_strategy not in naming_options:
+                            default_naming_strategy = "auto_shorten"
+                        naming_strategy = st.selectbox(
+                            "Output feature naming",
+                            options=naming_options,
+                            index=naming_options.index(default_naming_strategy),
+                            key=f"custom_naming_{file_key}",
+                            format_func=lambda x: {
+                                "auto_shorten": "Auto-shorten long names (recommended)",
+                                "keep_original": "Keep original source names",
+                                "custom_edit": "Manually edit output names",
+                            }.get(x, x),
+                            help=(
+                                "Controls how selected columns are named before prefixing. "
+                                "Useful for very long ACS-style column names."
+                            ),
+                        )
+
+                        column_renames: dict[str, str] = {}
+                        if naming_strategy == "auto_shorten":
+                            column_renames = {
+                                col: _suggest_short_feature_name(col) for col in selected_columns
+                            }
+                            if selected_columns:
+                                preview_names = pd.DataFrame(
+                                    {
+                                        "source_column": selected_columns,
+                                        "output_name": [column_renames[c] for c in selected_columns],
+                                    }
+                                )
+                                st.dataframe(
+                                    preview_names.head(12),
+                                    use_container_width=True,
+                                    height=180,
+                                )
+                        elif naming_strategy == "custom_edit" and selected_columns:
+                            prev_rename_map = prev_custom_meta.get("column_renames", {})
+                            if not isinstance(prev_rename_map, dict):
+                                prev_rename_map = {}
+                            rename_editor_df = pd.DataFrame(
+                                {
+                                    "source_column": selected_columns,
+                                    "output_name": [
+                                        prev_rename_map.get(c, _suggest_short_feature_name(c))
+                                        for c in selected_columns
+                                    ],
+                                }
+                            )
+                            edited = st.data_editor(
+                                rename_editor_df,
+                                key=f"custom_rename_editor_{file_key}",
+                                use_container_width=True,
+                                hide_index=True,
+                                disabled=["source_column"],
+                            )
+                            for _, row in edited.iterrows():
+                                src = str(row.get("source_column", "")).strip()
+                                out = str(row.get("output_name", "")).strip()
+                                if src in selected_columns and out:
+                                    column_renames[src] = out
+
+                        x_marker_count = 0
+                        for col in selected_columns:
+                            if col in preview_df.columns:
+                                x_marker_count += int(
+                                    preview_df[col].astype(str).str.fullmatch(r"\s*\(X\)\s*", na=False).sum()
+                                )
+                        if x_marker_count > 0:
+                            st.info(
+                                f"Detected {x_marker_count:,} '(X)' values in selected columns. "
+                                "These mean 'not available / not applicable' in ACS-style files and "
+                                "will be converted to missing values during processing."
+                            )
+
+                        default_prefix = prev_custom_meta.get("column_prefix") or _sanitize_column_prefix(
+                            Path(cf.name).stem
+                        )
+                        if any(_is_revenue_metric_column(c) for c in selected_columns):
+                            default_prefix = prev_custom_meta.get("column_prefix") or "revenue"
+                        column_prefix = st.text_input(
+                            "Column prefix (recommended to avoid name collisions)",
+                            value=default_prefix,
+                            key=f"custom_prefix_{file_key}",
+                            help="Columns will be renamed like prefix__column. Leave blank to keep original names.",
+                        )
+
+                        join_options = ["left", "outer"]
+                        default_join = prev_custom_meta.get("join_mode", "left")
+                        if default_join not in join_options:
+                            default_join = "left"
+                        join_mode = st.selectbox(
+                            "How to merge this file",
+                            options=join_options,
+                            index=join_options.index(default_join),
+                            key=f"custom_join_{file_key}",
+                            format_func=lambda x: (
+                                "left (supplement existing ZIPs only)"
+                                if x == "left"
+                                else "outer (also add ZIPs not already in core data)"
+                            ),
+                        )
+
+                        duplicate_options = ["first", "mean", "sum", "max", "min"]
+                        default_duplicate = prev_custom_meta.get("duplicate_policy", "first")
+                        if default_duplicate not in duplicate_options:
+                            default_duplicate = "first"
+                        duplicate_policy = st.selectbox(
+                            "If multiple rows share a ZIP",
+                            options=duplicate_options,
+                            index=duplicate_options.index(default_duplicate),
+                            key=f"custom_dupes_{file_key}",
+                            help=(
+                                "For mean/sum/max/min, numeric columns are aggregated. "
+                                "Non-numeric columns keep the first value."
+                            ),
+                        )
+
+                        fill_options = list(FILL_UNCOVERED_LABELS.keys())
+                        default_fill = prev_custom_meta.get("fill_uncovered_strategy", "none")
+                        if default_fill not in fill_options:
+                            default_fill = "none"
+                        fill_uncovered_strategy = st.selectbox(
+                            "If this file does not cover all base ZIPs",
+                            options=fill_options,
+                            index=fill_options.index(default_fill),
+                            key=f"custom_fill_{file_key}",
+                            format_func=lambda x: FILL_UNCOVERED_LABELS.get(x, x),
+                            help=(
+                                "Applies to numeric columns from this file for ZIPs present in "
+                                "the base dataset but missing from this custom file."
+                            ),
+                        )
+
+                        cf.seek(0)
+                        if not selected_columns:
+                            st.warning("Select at least one column to include this file.")
+                        else:
+                            custom_uploads_ready.append(
+                                {
+                                    "name": cf.name,
+                                    "content": cf.getvalue(),
+                                    "skip_rows": skip_rows,
+                                    "sheet_name": selected_sheet_name if ext in (".xlsx", ".xlsm", ".xls") else None,
+                                    "zip_col": zip_col,
+                                    "zip_normalization_mode": zip_normalization_mode,
+                                    "selected_columns": selected_columns,
+                                    "naming_strategy": naming_strategy,
+                                    "column_renames": column_renames,
+                                    "column_prefix": column_prefix,
+                                    "join_mode": join_mode,
+                                    "duplicate_policy": duplicate_policy,
+                                    "fill_uncovered_strategy": fill_uncovered_strategy,
+                                }
+                            )
+                    else:
+                        st.warning("Select a ZIP column to include this file.")
+                except Exception as e:
+                    st.error(f"Could not read {cf.name}: {e}")
+
+    # Show count of previous custom files
+    replace_prev_custom = st.checkbox(
+        "Replace previously uploaded custom files (instead of supplementing them)",
+        value=False,
+        help="By default, previous custom files are carried forward and combined with new uploads.",
+    )
+
+    if prev_custom and not custom_files:
+        st.info(
+            f"{len(prev_custom)} custom file(s) from previous version will be carried forward. "
+            "Upload new files to supplement them, or enable replace mode to start fresh."
+        )
+
+    st.divider()
+
+    # ── Constrained scoring mappings (fixed main-app inputs) ────────────
+    st.header("Scoring Input Mapping (Optional)")
+    st.caption(
+        "Map dataset columns to the fixed scoring inputs used by the main app sliders. "
+        "This keeps scoring behavior consistent while allowing client-specific schemas."
+    )
+
+    prev_scoring = prev_config.get("scoring_config", {}) if prev_config else {}
+    prev_map_by_component = {}
+    for mapping in prev_scoring.get("column_mappings", []):
+        if isinstance(mapping, dict):
+            component = mapping.get("target_component")
+            source_col = mapping.get("source_column")
+            if component and source_col:
+                prev_map_by_component[component] = source_col
+
+    mapping_options = _build_mapping_column_options(
+        prev_config=prev_config,
+        custom_uploads=custom_uploads_ready,
+        prev_custom=prev_custom,
+        replace_prev_custom=replace_prev_custom,
+    )
+
+    if prev_map_by_component:
+        st.caption("Previous mapping detected and pre-filled below.")
+
+    scoring_component_map: dict[str, str] = {}
+    for target in SCORING_MAPPING_TARGETS:
+        component = target["component"]
+        default_col = target["default_column"]
+        options = [""] + mapping_options
+
+        suggested = prev_map_by_component.get(component, "")
+        if not suggested and default_col in mapping_options:
+            suggested = default_col
+
+        default_index = options.index(suggested) if suggested in options else 0
+        selected_source = st.selectbox(
+            target["label"],
+            options=options,
+            index=default_index,
+            key=f"map_{component}",
+            help=target["help"],
+            format_func=lambda value: "(not mapped)" if value == "" else value,
+        )
+        if selected_source:
+            scoring_component_map[component] = selected_source
+
+    st.divider()
+
+    # ── Options ──────────────────────────────────────────────────────────
+    description = st.text_input(
+        "Version description (optional)",
+        placeholder="e.g., Updated financial data for 2024",
+    )
+    fetch_education = st.checkbox(
+        "Fetch education data from Census API",
+        value=True,
+        help="Calls the ACS API for education attainment by ZIP. Requires internet.",
+    )
+
+    # ── Process button ───────────────────────────────────────────────────
+    if st.button("Process & Save", type="primary", disabled=bool(missing)):
+        try:
+            _process_and_save(
+                uploads, custom_uploads_ready, prev_config, latest_version,
+                description, fetch_education, replace_prev_custom,
+                replace_prev_core, scoring_component_map,
+                core_skip_rows, pharmacy_zip_normalization_mode,
+            )
+        except Exception as e:
+            st.error(f"Processing failed: {e}")
+            logger.error("Upload processing failed", exc_info=True)
+            with st.expander("Error details"):
                 st.code(traceback.format_exc())
 
 
-def render_load_existing_config():
-    """Render section to load existing configuration."""
-    st.markdown("---")
-    st.header("📂 Load Existing Configuration")
-    
+def _process_and_save(
+    uploads,
+    custom_uploads,
+    prev_config,
+    prev_version,
+    description,
+    fetch_education,
+    replace_prev_custom,
+    replace_prev_core,
+    scoring_component_map,
+    core_skip_rows,
+    pharmacy_zip_normalization_mode,
+):
+    """Run the existing data pipeline on uploaded files and save the unified result."""
     storage = get_storage()
-    
-    # List datasets
-    datasets = storage.list_datasets()
-    
-    if not datasets:
-        st.info("No existing datasets found.")
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        selected_dataset = st.selectbox(
-            "Select Dataset",
-            options=[''] + datasets,
-            key="load_dataset_id"
+    version_id = generate_version_id()
+    prev_files = prev_config.get("uploaded_files", {}) if prev_config else {}
+    prev_custom = prev_config.get("custom_files", []) if prev_config else []
+    core_skip_rows = core_skip_rows or {}
+    resolved_core_skip_rows = {
+        key: _normalize_skip_rows(
+            core_skip_rows.get(key, DEFAULT_CORE_SKIP_ROWS.get(key, 0)),
+            default=DEFAULT_CORE_SKIP_ROWS.get(key, 0),
         )
-    
-    with col2:
-        if selected_dataset:
-            versions = storage.list_versions(selected_dataset)
-            latest = storage.get_latest_version(selected_dataset)
-            
-            # Mark latest version and include descriptions
-            version_options = []
-            for v in versions:
-                config = storage.get_config(selected_dataset, v)
-                desc = config.get('description', '') if config else ''
-                if v == latest:
-                    label = f"{v} (LATEST)" + (f" - {desc}" if desc else "")
-                else:
-                    label = v + (f" - {desc}" if desc else "")
-                version_options.append((v, label))
-            
-            selected_version = st.selectbox(
-                "Select Version",
-                options=[v[0] for v in version_options],
-                format_func=lambda x: next((v[1] for v in version_options if v[0] == x), x),
-                key="load_version_id"
+        for key, *_ in SLOTS
+    }
+    if pharmacy_zip_normalization_mode not in ZIP_NORMALIZATION_LABELS:
+        pharmacy_zip_normalization_mode = "extract_5_digit_regex"
+
+    progress = st.progress(0, text="Starting…")
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        work = Path(work_dir)
+        file_paths: dict = {}   # slot key → local path
+        file_map: dict = {}     # slot key → filename (saved in config for next time)
+
+        # ── Resolve each slot: new upload wins, else previous version ────
+        progress.progress(0.05, text="Preparing files…")
+        all_keys = [key for key, *_ in SLOTS]
+
+        for key in all_keys:
+            if key in uploads:
+                uf = uploads[key]
+                fname = uf.name
+                dest = work / fname
+                content = uf.getvalue()
+                dest.write_bytes(content)
+                file_paths[key] = str(dest)
+                file_map[key] = fname
+                storage.upload_file(DATASET_ID, version_id, fname, content)
+
+            elif (not replace_prev_core) and key in prev_files and prev_version:
+                fname = prev_files[key]
+                try:
+                    content = storage.download_file(DATASET_ID, prev_version, fname)
+                    dest = work / fname
+                    dest.write_bytes(content)
+                    file_paths[key] = str(dest)
+                    file_map[key] = fname
+                    storage.upload_file(DATASET_ID, version_id, fname, content)
+                except FileNotFoundError:
+                    required = {k for k, _, _, r, _ in SLOTS if r}
+                    if key in required:
+                        raise ValueError(
+                            f"Required file '{key}' ({fname}) missing from previous version"
+                        )
+
+        required_keys = {key for key, _, _, req, _ in SLOTS if req}
+        missing_required = sorted(k for k in required_keys if k not in file_paths)
+        if missing_required:
+            raise ValueError(f"Missing required core files: {', '.join(missing_required)}")
+
+        # ── Read sources using existing readers ──────────────────────────
+        progress.progress(0.10, text="Reading financial data…")
+        financial = read_financial_data(
+            file_paths["financial"],
+            skip_rows=resolved_core_skip_rows.get("financial", 0),
+        )
+
+        progress.progress(0.20, text="Reading health data…")
+        health = read_health_data(
+            file_paths["health"],
+            skip_rows=resolved_core_skip_rows.get("health", 0),
+        )
+
+        progress.progress(0.30, text="Reading pharmacy data…")
+        pharmacy = _read_pharmacy_upload(
+            file_paths["pharmacy"],
+            skip_rows=resolved_core_skip_rows.get("pharmacy", 0),
+            zip_normalization_mode=pharmacy_zip_normalization_mode,
+        )
+
+        progress.progress(0.40, text="Reading population data…")
+        population = read_population_data(
+            file_paths["population"],
+            skip_rows=resolved_core_skip_rows.get("population", DEFAULT_CORE_SKIP_ROWS["population"]),
+        )
+
+        hhi = None
+        if "hhi" in file_paths:
+            progress.progress(0.45, text="Reading HHI data…")
+            hhi = read_hhi_excel(
+                file_paths["hhi"],
+                skip_rows=resolved_core_skip_rows.get("hhi", 0),
             )
-    
-    if selected_dataset and selected_version:
-        if st.button("Load Configuration"):
-            config_data = storage.get_config(selected_dataset, selected_version)
-            
-            if config_data:
-                desc = config_data.get('description', '')
-                st.success(f"Loaded configuration for {selected_dataset} v{selected_version}" + (f": {desc}" if desc else ""))
-                
-                # Show scoring config if present
-                if 'scoring_config' in config_data:
-                    st.markdown("### Scoring Configuration")
-                    scoring = config_data['scoring_config']
-                    
-                    if 'column_mappings' in scoring:
-                        st.markdown("**Column Mappings:**")
-                        for m in scoring['column_mappings']:
-                            comp = SCORING_COMPONENTS.get(m['target_component'], {})
-                            comp_name = comp.display_name if hasattr(comp, 'display_name') else m['target_component']
-                            st.write(f"- `{m['source_column']}` → **{comp_name}**")
-                
-                with st.expander("Full Configuration JSON"):
-                    st.json(config_data)
-            else:
-                st.error("Configuration not found")
 
+        # ── Core merge (preprocess) ──────────────────────────────────────
+        progress.progress(0.50, text="Merging core datasets…")
+        df = preprocess(financial, health, pharmacy, population, hhi=hhi)
 
-def main():
-    """Main function to render the upload wizard."""
-    init_session_state()
-    
-    st.title("📤 Dataset Upload Wizard")
-    st.markdown("Upload and configure new datasets for the Pharmacy Desert analysis.")
-    
-    # Ensure current_step is an integer
-    current_step = int(st.session_state.current_step)
-    
-    # Step indicator (now 5 steps)
-    render_step_indicator(current_step, total_steps=5)
-    st.markdown("---")
-    
-    # Render current step
-    if current_step == 1:
-        render_file_upload_section()
-    elif current_step == 2:
-        render_column_config_section()
-    elif current_step == 3:
-        render_cleaning_rules_section()
-    elif current_step == 4:
-        render_scoring_config_section()
-    elif current_step == 5:
-        render_review_submit_section()
-    
-    # Load existing config section (only on step 1 or 5 to avoid interference)
-    if current_step in [1, 5]:
-        try:
-            render_load_existing_config()
-        except Exception as e:
-            st.warning(f"Could not load existing configs: {e}")
+        # ── Education data from Census API ───────────────────────────────
+        if fetch_education:
+            progress.progress(0.55, text="Fetching education data (Census API)…")
+            try:
+                edu = read_education_data_acs(year=2023)
+                df = df.merge(edu[["zip", "edu_hs_or_lower_pct"]], on="zip", how="left")
+            except Exception as e:
+                st.warning(f"Education data fetch failed (non-fatal): {e}")
+
+        # ── County desert downscaling ────────────────────────────────────
+        if "hud_crosswalk" in file_paths and "county_desert" in file_paths:
+            progress.progress(0.60, text="Processing county desert data…")
+            hud = read_hud_zip_county_crosswalk(
+                file_paths["hud_crosswalk"],
+                skip_rows=resolved_core_skip_rows.get("hud_crosswalk", 0),
+            )
+            county = read_county_desert_csv(
+                file_paths["county_desert"],
+                skip_rows=resolved_core_skip_rows.get("county_desert", 0),
+            )
+            zip_desert = downscale_county_to_zip(county, hud)
+            df = df.merge(zip_desert, on="zip", how="left")
+
+        # ── Merge custom / proprietary datasets ──────────────────────────
+        custom_file_meta: list[dict] = []
+
+        prev_custom_by_name = {
+            pc.get("filename"): pc for pc in prev_custom if isinstance(pc, dict) and pc.get("filename")
+        }
+        new_custom_by_name = {cu["name"]: cu for cu in custom_uploads} if custom_uploads else {}
+        carried_prev_names = set()
+
+        custom_sources_to_merge: list[tuple[str, dict, bytes]] = []
+
+        if prev_custom and prev_version and not replace_prev_custom:
+            for fname, pc in prev_custom_by_name.items():
+                if fname in new_custom_by_name:
+                    continue  # replaced by new upload with same filename
+                try:
+                    content = storage.download_file(DATASET_ID, prev_version, f"custom_{fname}")
+                    custom_sources_to_merge.append(("previous", pc, content))
+                    carried_prev_names.add(fname)
+                except Exception as e:
+                    st.warning(f"Could not carry forward custom file '{fname}': {e}")
+
+        for cu in custom_uploads or []:
+            custom_sources_to_merge.append(("new", cu, cu["content"]))
+
+        if custom_sources_to_merge:
+            progress.progress(0.68, text="Merging custom datasets…")
+
+        for origin, custom_meta_input, content in custom_sources_to_merge:
+            fname = custom_meta_input["filename"] if origin == "previous" else custom_meta_input["name"]
+            try:
+                raw_custom_df = _read_custom_bytes(
+                    content,
+                    fname,
+                    skip_rows=_normalize_skip_rows(custom_meta_input.get("skip_rows", 0)),
+                    sheet_name=custom_meta_input.get("sheet_name"),
+                )
+
+                merge_meta = {
+                    "name": fname,
+                    "zip_col": custom_meta_input.get("zip_col"),
+                    "zip_normalization_mode": custom_meta_input.get(
+                        "zip_normalization_mode", "extract_5_digit_regex"
+                    ),
+                    "selected_columns": custom_meta_input.get("selected_columns"),
+                    "column_renames": custom_meta_input.get("column_renames"),
+                    "column_prefix": custom_meta_input.get("column_prefix", Path(fname).stem),
+                    "join_mode": custom_meta_input.get("join_mode", "outer"),
+                    "duplicate_policy": custom_meta_input.get("duplicate_policy", "first"),
+                    "fill_uncovered_strategy": custom_meta_input.get("fill_uncovered_strategy", "none"),
+                }
+                prepared_custom_df, prep_info = _prepare_custom_dataframe(raw_custom_df, merge_meta)
+
+                if prepared_custom_df.empty:
+                    st.warning(f"Skipping custom file '{fname}' because no rows contained valid ZIP values.")
+                    continue
+
+                if not prep_info["columns"]:
+                    st.warning(f"Skipping custom file '{fname}' because no columns were selected.")
+                    continue
+
+                df, new_cols, filled_cells = _merge_custom_into_dataset(df, prepared_custom_df, merge_meta)
+                logger.info(
+                    "Merged custom file '%s' (%s): +%s columns, %s rows, join=%s, dupes=%s, fill=%s, cells=%s",
+                    fname,
+                    origin,
+                    new_cols,
+                    len(prepared_custom_df),
+                    merge_meta["join_mode"],
+                    prep_info["duplicate_policy"],
+                    merge_meta["fill_uncovered_strategy"],
+                    filled_cells,
+                )
+
+                storage.upload_file(DATASET_ID, version_id, f"custom_{fname}", content)
+                custom_file_meta.append({
+                    "filename": fname,
+                    "skip_rows": _normalize_skip_rows(custom_meta_input.get("skip_rows", 0)),
+                    "sheet_name": custom_meta_input.get("sheet_name"),
+                    "zip_col": merge_meta["zip_col"],
+                    "zip_normalization_mode": prep_info["zip_normalization_mode"],
+                    "selected_columns": custom_meta_input.get("selected_columns"),
+                    "naming_strategy": custom_meta_input.get("naming_strategy", "keep_original"),
+                    "column_renames": prep_info.get("column_renames", {}),
+                    "column_prefix": prep_info["column_prefix"],
+                    "join_mode": merge_meta["join_mode"],
+                    "duplicate_policy": prep_info["duplicate_policy"],
+                    "fill_uncovered_strategy": merge_meta["fill_uncovered_strategy"],
+                    "filled_uncovered_cells": filled_cells,
+                    "x_marker_cells_cleaned": prep_info.get("x_marker_cells_cleaned", 0),
+                    "coerced_numeric_columns": prep_info.get("coerced_numeric_columns", []),
+                    "merged_columns": prep_info["columns"],
+                    "source_origin": origin,
+                })
+            except Exception as e:
+                st.warning(f"Could not process custom file '{fname}': {e}")
+
+        if carried_prev_names and custom_uploads and not replace_prev_custom:
+            st.info(
+                f"Supplemented with {len(custom_uploads)} new custom file(s) and "
+                f"carried forward {len(carried_prev_names)} previous custom file(s)."
+            )
+
+        # ── Fill NaN for core columns introduced by outer joins ─────────
+        for col, default in [
+            ("n_pharmacies", 0), ("population", 0), ("pop_density", 0),
+        ]:
+            if col in df.columns:
+                df[col] = df[col].fillna(default)
+        if "n_pharmacies" in df.columns:
+            df["n_pharmacies"] = df["n_pharmacies"].astype(int)
+
+        # ── Save unified CSV ─────────────────────────────────────────────
+        progress.progress(0.80, text="Saving unified dataset…")
+        buf = io.BytesIO()
+        df.to_csv(buf, index=False)
+        csv_bytes = buf.getvalue()
+        storage.upload_unified_dataset(DATASET_ID, version_id, csv_bytes)
+
+        # ── Save config ──────────────────────────────────────────────────
+        progress.progress(0.90, text="Saving configuration…")
+        sources = []
+        for slot_key, fname in file_map.items():
+            sources.append({
+                "source_id": generate_source_id(fname),
+                "filename": fname,
+                "source_kind": "core",
+                "slot": slot_key,
+                "skip_rows": resolved_core_skip_rows.get(slot_key, 0),
+                "zip_normalization_mode": (
+                    pharmacy_zip_normalization_mode if slot_key == "pharmacy" else None
+                ),
+            })
+
+        for custom_meta in custom_file_meta:
+            original_name = custom_meta.get("filename")
+            stored_name = f"custom_{original_name}"
+            sources.append({
+                "source_id": generate_source_id(stored_name),
+                "filename": stored_name,
+                "source_kind": "custom",
+                "original_filename": original_name,
+                "zip_column": custom_meta.get("zip_col"),
+                "skip_rows": custom_meta.get("skip_rows", 0),
+                "zip_normalization_mode": custom_meta.get("zip_normalization_mode"),
+                "naming_strategy": custom_meta.get("naming_strategy"),
+                "column_renames": custom_meta.get("column_renames", {}),
+                "join_mode": custom_meta.get("join_mode"),
+                "duplicate_policy": custom_meta.get("duplicate_policy"),
+                "fill_uncovered_strategy": custom_meta.get("fill_uncovered_strategy"),
+                "coerced_numeric_columns": custom_meta.get("coerced_numeric_columns", []),
+                "x_marker_cells_cleaned": custom_meta.get("x_marker_cells_cleaned", 0),
+                "merged_columns": custom_meta.get("merged_columns", []),
+            })
+
+        cfg = build_dataset_config(DATASET_ID, version_id, sources=sources)
+        cfg["unified"] = True
+        cfg["unified_rows"] = len(df)
+        cfg["unified_columns"] = list(df.columns)
+        cfg["uploaded_files"] = file_map
+        cfg["custom_files"] = custom_file_meta
+        cfg["core_parse_options"] = {
+            **resolved_core_skip_rows,
+            "pharmacy_zip_normalization_mode": pharmacy_zip_normalization_mode,
+        }
+        prev_scoring = prev_config.get("scoring_config", {}) if prev_config else {}
+        mapped_columns = []
+        dropped_mappings = []
+        if scoring_component_map:
+            for component, source_column in scoring_component_map.items():
+                if source_column in df.columns:
+                    mapped_columns.append({
+                        "source_column": source_column,
+                        "target_component": component,
+                        "transform": None,
+                    })
+                else:
+                    dropped_mappings.append(f"{component}->{source_column}")
+        else:
+            for mapping in prev_scoring.get("column_mappings", []) if isinstance(prev_scoring, dict) else []:
+                if not isinstance(mapping, dict):
+                    continue
+                source_column = mapping.get("source_column")
+                target_component = mapping.get("target_component")
+                if not source_column or not target_component:
+                    continue
+                if source_column in df.columns:
+                    mapped_columns.append({
+                        "source_column": source_column,
+                        "target_component": target_component,
+                        "transform": mapping.get("transform"),
+                    })
+                else:
+                    dropped_mappings.append(f"{target_component}->{source_column}")
+
+        if dropped_mappings:
+            st.warning(
+                "Some mappings were not saved because columns were not in the final dataset: "
+                + ", ".join(dropped_mappings)
+            )
+
+        mapped_source_columns = {m["source_column"] for m in mapped_columns if "source_column" in m}
+        prev_custom_feature_weights = (
+            prev_scoring.get("custom_feature_weights", {}) if isinstance(prev_scoring, dict) else {}
+        )
+        custom_feature_weights: dict[str, float] = {}
+
+        # Auto-register numeric custom-uploaded columns as additional scorable features.
+        for custom_meta in custom_file_meta:
+            for col in custom_meta.get("merged_columns", []):
+                if (
+                    not isinstance(col, str)
+                    or col not in df.columns
+                    or col in mapped_source_columns
+                    or not _is_numeric_scoring_candidate(df[col])
+                ):
+                    continue
+                try:
+                    prior_weight = float(
+                        prev_custom_feature_weights.get(col, DEFAULT_CUSTOM_FEATURE_WEIGHT)
+                    )
+                except Exception:
+                    prior_weight = DEFAULT_CUSTOM_FEATURE_WEIGHT
+                custom_feature_weights[col] = min(1.0, max(0.0, prior_weight))
+
+        # Preserve previous custom-feature weights for columns that still exist.
+        for col, weight in prev_custom_feature_weights.items():
+            if (
+                isinstance(col, str)
+                and col in df.columns
+                and col not in mapped_source_columns
+                and _is_numeric_scoring_candidate(df[col])
+                and col not in custom_feature_weights
+            ):
+                try:
+                    weight_value = float(weight)
+                except Exception:
+                    continue
+                custom_feature_weights[col] = min(1.0, max(0.0, weight_value))
+
+        cfg["scoring_config"] = {
+            "column_mappings": mapped_columns,
+            "weight_overrides": prev_scoring.get("weight_overrides", {})
+            if isinstance(prev_scoring, dict)
+            else {},
+            "custom_feature_weights": custom_feature_weights,
+            "desert_threshold": prev_scoring.get("desert_threshold", 2.0)
+            if isinstance(prev_scoring, dict)
+            else 2.0,
+            "normalize_scores": prev_scoring.get("normalize_scores", True)
+            if isinstance(prev_scoring, dict)
+            else True,
+        }
+        if description:
+            cfg["description"] = description
+        elif prev_config and prev_config.get("description"):
+            cfg["description"] = prev_config["description"]
+        storage.upload_config(DATASET_ID, version_id, cfg)
+
+        # ── Update LATEST ────────────────────────────────────────────────
+        storage.update_latest(DATASET_ID, version_id)
+        st.cache_data.clear()
+        progress.progress(1.0, text="Done!")
+
+    # ── Results ──────────────────────────────────────────────────────────
+    st.success(
+        f"Dataset saved! Version `{version_id}` — "
+        f"**{len(df):,} rows × {len(df.columns)} columns**"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Rows", f"{len(df):,}")
+    with c2:
+        st.metric("Columns", len(df.columns))
+    with c3:
+        st.metric("Core Files", len(file_map))
+    with c4:
+        st.metric("Custom Files", len(custom_file_meta))
+
+    st.markdown("### Preview")
+    st.dataframe(df.head(50), use_container_width=True, height=400)
+    st.markdown(f"**Columns ({len(df.columns)}):** `{', '.join(df.columns)}`")
+
+    st.download_button(
+        "Download unified dataset",
+        csv_bytes,
+        f"pharmacy_desert_data_{version_id}.csv",
+        "text/csv",
+    )
 
 
 if __name__ == "__main__":

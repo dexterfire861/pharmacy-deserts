@@ -13,7 +13,9 @@ import numpy as np
 from pathlib import Path
 import sys
 import os
+import io
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,8 @@ from data.loaders import (
     read_financial_data, read_health_data, read_pharmacy_data, read_population_data,
     read_hhi_excel, read_population_labels,
     read_education_data_acs, read_hud_zip_county_crosswalk, read_county_desert_csv,
-    downscale_county_to_zip, load_all_pharmacist_data
+    downscale_county_to_zip, load_all_pharmacist_data, load_npi_pharmacist_data,
+    load_npi_pharmacy_data
 )
 from data.features import preprocess
 
@@ -81,7 +84,7 @@ def _is_s3_environment() -> bool:
 @st.cache_data(show_spinner="Loading math model datasets...")
 def load_math_dataset_bundle():
     """
-    Load and merge all datasets needed for Math and Blended scoring modes.
+    Load and merge all datasets needed for Math scoring mode.
     
     Automatically loads from S3 in production or local filesystem in development.
     
@@ -347,19 +350,167 @@ def load_glm_results():
     return ranked
 
 
+def _resolve_first_existing_path(candidates: list[str]) -> Optional[Path]:
+    """Return the first existing path from an ordered candidate list."""
+    for candidate in candidates:
+        p = Path(candidate)
+        if p.exists():
+            return p
+    return None
+
+
+@st.cache_data(show_spinner="Loading Profit Model v2 results...")
+def load_profit_model_v2_results():
+    """
+    Load Part 2 Walgreens Profit Model outputs and standardize for app display.
+
+    Expected output file:
+      - results_v2/profit_scores.csv
+
+    Returns:
+        DataFrame compatible with app ranking views (zip, final_score, etc.).
+    """
+    path = _resolve_first_existing_path(
+        [
+            "results_v2/profit_scores.csv",
+            "deployment/walgreens_portfolio/results_v2/profit_scores.csv",
+        ]
+    )
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        ranked = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str, "zip": str})
+    except Exception as e:
+        logger.warning(f"Failed loading Profit Model v2 results from {path}: {e}")
+        return pd.DataFrame()
+
+    zip_col = next(
+        (c for c in ["zip", "ZCTA5", "zcta5", "ZIP", "Zip"] if c in ranked.columns),
+        None,
+    )
+    if not zip_col:
+        logger.warning("Profit Model v2 output missing ZIP/ZCTA column.")
+        return pd.DataFrame()
+
+    ranked["zip"] = ranked[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    ranked = ranked.dropna(subset=["zip"]).copy()
+
+    score_col = "profit_score" if "profit_score" in ranked.columns else None
+    if not score_col:
+        logger.warning("Profit Model v2 output missing 'profit_score'.")
+        return pd.DataFrame()
+
+    ranked[score_col] = pd.to_numeric(ranked[score_col], errors="coerce")
+    ranked = ranked.dropna(subset=[score_col]).copy()
+    ranked["score"] = ranked[score_col]
+    ranked["final_score"] = ranked[score_col]
+    ranked["ai_score"] = np.nan
+
+    if "pharmacies_count" in ranked.columns and "n_pharmacies" not in ranked.columns:
+        ranked["n_pharmacies"] = pd.to_numeric(ranked["pharmacies_count"], errors="coerce")
+
+    if "is_pharmacy_desert" in ranked.columns:
+        ranked["desert_flag"] = (
+            pd.to_numeric(ranked["is_pharmacy_desert"], errors="coerce").fillna(0).astype(int)
+        )
+    elif "n_pharmacies" in ranked.columns:
+        ranked["desert_flag"] = (
+            pd.to_numeric(ranked["n_pharmacies"], errors="coerce").fillna(0).eq(0).astype(int)
+        )
+    else:
+        ranked["desert_flag"] = 0
+
+    if "lat" in ranked.columns:
+        ranked["lat"] = pd.to_numeric(ranked["lat"], errors="coerce")
+    if "lon" in ranked.columns:
+        ranked["lon"] = pd.to_numeric(ranked["lon"], errors="coerce")
+
+    ranked["model_source"] = "profit_model_v2"
+    ranked = ranked.sort_values("final_score", ascending=False, na_position="last").reset_index(drop=True)
+    return ranked
+
+
+@st.cache_data(show_spinner="Loading Walgreens Optimizer results...")
+def load_walgreens_optimizer_results():
+    """
+    Load Part 3 Walgreens optimizer outputs and standardize for app display.
+
+    Expected output file:
+      - results_walgreens/store_viability_scores.csv
+
+    Returns:
+        DataFrame compatible with app ranking views (zip, final_score, etc.).
+    """
+    path = _resolve_first_existing_path(
+        [
+            "results_walgreens/store_viability_scores.csv",
+            "deployment/walgreens_portfolio/results_walgreens/store_viability_scores.csv",
+        ]
+    )
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        stores = pd.read_csv(path, low_memory=False, dtype={"ZCTA5": str, "zip": str})
+    except Exception as e:
+        logger.warning(f"Failed loading Walgreens Optimizer results from {path}: {e}")
+        return pd.DataFrame()
+
+    zip_col = next(
+        (c for c in ["zip", "ZCTA5", "zcta5", "ZIP", "Zip"] if c in stores.columns),
+        None,
+    )
+    if not zip_col:
+        logger.warning("Walgreens optimizer output missing ZIP/ZCTA column.")
+        return pd.DataFrame()
+    if "store_viability" not in stores.columns:
+        logger.warning("Walgreens optimizer output missing 'store_viability'.")
+        return pd.DataFrame()
+
+    stores["zip"] = stores[zip_col].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    stores["store_viability"] = pd.to_numeric(stores["store_viability"], errors="coerce")
+    stores = stores.dropna(subset=["zip", "store_viability"]).copy()
+
+    # If store-level rows exist, keep the top-viability store per ZIP for map/ranking.
+    ranked = (
+        stores.sort_values("store_viability", ascending=False)
+        .drop_duplicates(subset=["zip"], keep="first")
+        .copy()
+    )
+
+    ranked["score"] = ranked["store_viability"]
+    ranked["final_score"] = ranked["store_viability"]
+    ranked["ai_score"] = np.nan
+    ranked["desert_flag"] = 0
+
+    if "total_pharmacies" in ranked.columns and "n_pharmacies" not in ranked.columns:
+        ranked["n_pharmacies"] = pd.to_numeric(ranked["total_pharmacies"], errors="coerce")
+
+    if "lat" in ranked.columns:
+        ranked["lat"] = pd.to_numeric(ranked["lat"], errors="coerce")
+    if "lon" in ranked.columns:
+        ranked["lon"] = pd.to_numeric(ranked["lon"], errors="coerce")
+
+    ranked["model_source"] = "walgreens_optimizer_v2"
+    ranked = ranked.sort_values("final_score", ascending=False, na_position="last").reset_index(drop=True)
+    return ranked
+
+
 @st.cache_data(show_spinner="Loading location data...")
 def load_latlon_lookup():
     """
-    Load minimal lat/lon lookup table from population data.
+    Load minimal lat/lon lookup table.
     
-    This is used in GLM Only mode when GLM results don't include lat/lon.
-    Much lighter than loading the full math dataset bundle.
+    Tries population_data.csv first, then falls back to the unified dataset.
     
     Returns:
-        DataFrame with columns: zip, lat, lon (empty if file not found)
+        DataFrame with columns: zip, lat, lon (empty if no source found)
     """
     config = get_config()
-    
+    empty = pd.DataFrame(columns=["zip", "lat", "lon"])
+
+    # --- Attempt 1: population_data.csv (legacy raw file) ---
     try:
         if _is_s3_environment():
             from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
@@ -371,27 +522,45 @@ def load_latlon_lookup():
             df = pd.read_csv(io.BytesIO(data), skiprows=10)
         else:
             population_path = Path('raw_data/population_data.csv')
-            if not population_path.exists():
-                logger.warning(f"Population data file not found: {population_path}")
-                return pd.DataFrame(columns=["zip", "lat", "lon"])
-            df = pd.read_csv(population_path, skiprows=10)
-        
-        df.columns = [str(c).strip() for c in df.columns]
-        lower = {c.lower(): c for c in df.columns}
-        
-        if not all(k in lower for k in ["zip", "lat", "long"]):
-            return pd.DataFrame(columns=["zip", "lat", "lon"])
-        
-        out = pd.DataFrame({
-            "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
-            "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
-            "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
-        })
-        
-        return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+            if population_path.exists():
+                df = pd.read_csv(population_path, skiprows=10)
+            else:
+                df = None
+
+        if df is not None:
+            df.columns = [str(c).strip() for c in df.columns]
+            lower = {c.lower(): c for c in df.columns}
+            if all(k in lower for k in ["zip", "lat", "long"]):
+                out = pd.DataFrame({
+                    "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+                    "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
+                    "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
+                })
+                out = out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+                if not out.empty:
+                    return out
     except Exception as e:
-        logger.warning(f"Failed to load lat/lon lookup: {e}")
-        return pd.DataFrame(columns=["zip", "lat", "lon"])
+        logger.warning(f"Population file lat/lon load failed: {e}")
+
+    # --- Attempt 2: unified dataset (has lat/lon from preprocessing) ---
+    try:
+        from storage.datasets import get_storage
+        storage = get_storage()
+        version_id = storage.get_latest_version("pharmacy_data")
+        if version_id:
+            raw = storage.download_unified_dataset("pharmacy_data", version_id)
+            udf = pd.read_csv(io.BytesIO(raw), dtype={"zip": str}, usecols=lambda c: c in ("zip", "lat", "lon"))
+            if {"zip", "lat", "lon"}.issubset(udf.columns):
+                udf["zip"] = udf["zip"].astype(str).str.zfill(5)
+                udf["lat"] = pd.to_numeric(udf["lat"], errors="coerce")
+                udf["lon"] = pd.to_numeric(udf["lon"], errors="coerce")
+                out = udf.dropna(subset=["zip", "lat", "lon"]).drop_duplicates(subset=["zip"])
+                if not out.empty:
+                    return out
+    except Exception as e:
+        logger.warning(f"Unified dataset lat/lon load failed: {e}")
+
+    return empty
 
 
 @st.cache_data(show_spinner="Loading pharmacist data...")
@@ -404,6 +573,7 @@ def load_pharmacist_data_only():
         DataFrame with pharmacist data (empty if not found)
     """
     config = get_config()
+    auto_build_nppes = os.getenv("NPPES_AUTO_BUILD", "false").lower() == "true"
     
     try:
         if _is_s3_environment():
@@ -416,6 +586,10 @@ def load_pharmacist_data_only():
             local_path = download_s3_directory(bucket, key.rstrip('/') + '/', temp_dir)
             return load_all_pharmacist_data(local_path)
         else:
+            npi_df = load_npi_pharmacist_data("raw_data", auto_build=auto_build_nppes)
+            if not npi_df.empty:
+                return npi_df
+
             raw_data_path = Path('raw_data')
             if not raw_data_path.exists():
                 logger.warning(f"Raw data directory not found: {raw_data_path}")
@@ -424,6 +598,59 @@ def load_pharmacist_data_only():
     except Exception as e:
         logger.warning(f"Failed to load pharmacist data: {e}")
         return pd.DataFrame(columns=['Short_ZIP'])
+
+
+@st.cache_data(show_spinner="Loading pharmacy detail data...")
+def load_pharmacy_data_only():
+    """
+    Load detailed pharmacy-location data for map ZIP popups.
+
+    Prefers NPPES-derived pharmacy details when available, then falls back to
+    legacy pharmacy files.
+    """
+    try:
+        auto_build_nppes = os.getenv("NPPES_AUTO_BUILD", "false").lower() == "true"
+        if not _is_s3_environment():
+            npi_df = load_npi_pharmacy_data("raw_data", auto_build=auto_build_nppes)
+            if not npi_df.empty:
+                return npi_df
+
+            # Legacy fallback: derive a minimal popup table from core pharmacy data.
+            legacy_path = Path("raw_data/Pharmacy_list_ZIP_fixed_final")
+            if legacy_path.exists():
+                legacy = read_pharmacy_data(str(legacy_path))
+            else:
+                legacy = pd.DataFrame()
+
+            if legacy is not None and not legacy.empty:
+                pharmacy_name_col = (
+                    legacy["pharmacy_name"].astype(str)
+                    if "pharmacy_name" in legacy.columns
+                    else pd.Series("", index=legacy.index, dtype="object")
+                )
+                state_col = (
+                    legacy["state"].astype(str)
+                    if "state" in legacy.columns
+                    else pd.Series("", index=legacy.index, dtype="object")
+                )
+                out = pd.DataFrame(
+                    {
+                        "Short_ZIP": legacy["zip"].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+                        "pharmacy_name": pharmacy_name_col,
+                        "Phone": "",
+                        "Address": "",
+                        "City": "",
+                        "State": state_col,
+                        "Chain": "Independent",
+                    }
+                )
+                return out.dropna(subset=["Short_ZIP", "pharmacy_name"])
+
+        # S3 mode fallback currently unsupported for NPPES details.
+        return pd.DataFrame(columns=["Short_ZIP", "pharmacy_name", "Phone", "Address"])
+    except Exception as e:
+        logger.warning(f"Failed to load pharmacy detail data: {e}")
+        return pd.DataFrame(columns=["Short_ZIP", "pharmacy_name", "Phone", "Address"])
 
 
 def get_glm_model_info():
@@ -500,53 +727,57 @@ def load_dataset_from_config_cached(dataset_id: str, version_id: str = None):
     return df, scoring_config_dict
 
 
-@st.cache_data(show_spinner="Loading smart dataset bundle...")
-def load_smart_dataset_bundle(active_dataset_id: str = ""):
+@st.cache_data(show_spinner="Loading dataset...")
+def load_smart_dataset_bundle(active_dataset_id: str = "", dataset_version_hint: str = ""):
     """
-    Smart dataset loader that loads from dataset config if ID provided.
-    
+    Load the active dataset for the app.
+
+    If *active_dataset_id* points to an uploaded (unified) dataset, that dataset
+    IS the complete data — no merging with a default bundle is needed.
+
+    Falls back to the built-in default dataset when no uploaded data exists.
+
     Args:
-        active_dataset_id: Dataset ID to load (empty string for default)
-    
+        active_dataset_id: Dataset ID to load (empty string for default only)
+        dataset_version_hint: Optional version ID to include in the cache key
+
     Returns:
-        tuple: (merged_df, pharmacist_data, scoring_config_dict or None)
+        tuple: (df, pharmacist_data, scoring_config_dict or None)
     """
+    from models.schema import get_default_scoring_config
+
+    # ------------------------------------------------------------------
+    # If an uploaded dataset exists, load it directly (unified CSV)
+    # ------------------------------------------------------------------
     if active_dataset_id:
-        logger.info(f"Loading from dataset config: {active_dataset_id}")
-        
+        logger.info(f"Loading uploaded dataset: {active_dataset_id}")
         try:
-            # Load the configured dataset with scoring config
-            df, scoring_config_dict = load_dataset_from_config_cached(active_dataset_id)
-            
-            # Still need pharmacist data from default source
+            version_id = dataset_version_hint or None
+            uploaded_df, scoring_config_dict = load_dataset_from_config_cached(
+                active_dataset_id, version_id=version_id
+            )
+            logger.info(f"Uploaded dataset: {len(uploaded_df)} rows, {len(uploaded_df.columns)} columns")
+
             pharmacist_data = load_pharmacist_data_only()
-            
-            return df, pharmacist_data, scoring_config_dict
+            return uploaded_df, pharmacist_data, scoring_config_dict
         except (ValueError, FileNotFoundError) as e:
-            # Dataset doesn't exist yet - return empty
-            logger.warning(f"Dataset '{active_dataset_id}' not found: {e}")
-            from models.schema import get_default_scoring_config
-            empty_df = pd.DataFrame(columns=['zip', 'zcta5'])
-            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
-            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
-    else:
-        # Fall back to default loading (returns default scoring config)
-        # But first check if default files exist
-        if not Path('raw_data/financial_data.csv').exists():
-            # No default data available - return empty with default config
-            logger.warning("No default raw_data files found and no dataset selected")
-            from models.schema import get_default_scoring_config
-            empty_df = pd.DataFrame(columns=['zip'])
-            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
-            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
-        
-        df, pharmacist_data = load_math_dataset_bundle()
-        
-        # Get default scoring config
-        from models.schema import get_default_scoring_config
+            logger.warning(f"Dataset '{active_dataset_id}' not found: {e}. Falling back to default.")
+
+    # ------------------------------------------------------------------
+    # Fallback: load built-in default dataset from raw_data/
+    # ------------------------------------------------------------------
+    logger.info("Loading default dataset from raw_data/")
+    default_files_exist = Path('raw_data/financial_data.csv').exists()
+
+    if not default_files_exist:
+        logger.warning("No default raw_data files found")
         default_config = get_default_scoring_config()
-        
-        return df, pharmacist_data, default_config.to_dict()
+        return pd.DataFrame(columns=['zip']), pd.DataFrame(columns=['Short_ZIP']), default_config.to_dict()
+
+    default_df, default_pharmacist = load_math_dataset_bundle()
+    default_config = get_default_scoring_config()
+    pharmacist_data = default_pharmacist if not default_pharmacist.empty else load_pharmacist_data_only()
+    return default_df, pharmacist_data, default_config.to_dict()
 
 
 def get_scoring_config_object(scoring_config_dict):

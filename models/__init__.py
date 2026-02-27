@@ -5,9 +5,11 @@ Scoring and AI model modules for pharmacy desert analysis.
 from .scoring import (
     score_candidates, 
     score_with_config,
+    score_with_features,
     average_scores, 
     export_math_scores_csv,
     get_available_weights_for_dataset,
+    get_available_features_for_weighting,
 )
 from .ai_scores import read_ifae_csv
 from .schema import (
@@ -28,9 +30,11 @@ __all__ = [
     # Scoring functions
     'score_candidates',
     'score_with_config',
+    'score_with_features',
     'average_scores',
     'export_math_scores_csv',
     'get_available_weights_for_dataset',
+    'get_available_features_for_weighting',
     'read_ifae_csv',
     # Schema classes
     'ScoringConfig',
