@@ -1,0 +1,25 @@
+{
+  "model_version": "20260131_212427",
+  "trained_at": "2026-01-31T21:24:28.212627",
+  "dataset_id": "pharmacy_data",
+  "dataset_version": "20260131_212427",
+  "data_sources": [
+    "health_data.csv"
+  ],
+  "row_count": 32520,
+  "feature_columns": [
+    "CANCER",
+    "FOODSTAMP",
+    "DEPRESSION"
+  ],
+  "scoring_config": null,
+  "training_params": {
+    "config_path": "/var/folders/1m/5nsmtnrd1q35fs00r7595vw00000gn/T/training_20260131_212427_lw7h11fa/training_config.json"
+  },
+  "status": "active",
+  "metrics": {
+    "status": "placeholder",
+    "note": "Training script not yet adapted for automated metrics",
+    "training_duration_sec": 0.06217217445373535
+  }
+}

@@ -16,9 +16,9 @@ from utils.cache import cache_data
 # =============================================================================
 
 @cache_data
-def read_financial_data(file_path):
+def read_financial_data(file_path, skip_rows=0):
     """Read financial/income data from Census CSV."""
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, skiprows=skip_rows)
     df = df[['NAME', 'S1901_C01_012E']]
     df['zip'] = df['NAME'].str.extract(r'(\d{5})')
     return df
@@ -60,21 +60,21 @@ def read_education_data_acs(year=2023, api_key=None):
 # =============================================================================
 
 @cache_data
-def read_health_data(file_path):
+def read_health_data(file_path, skip_rows=0):
     """Read health burden data from PLACES."""
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, skiprows=skip_rows)
     df = df[['ZCTA5', 'GHLTH_CrudePrev']]
     df['ZCTA5'] = df['ZCTA5'].astype(str).str.split('.').str[0].str.zfill(5)
     return df
 
 
 @cache_data
-def read_hhi_excel(file_path):
+def read_hhi_excel(file_path, skip_rows=0):
     """
     Read Heat-Health Index (HHI) Excel data.
     Returns: DataFrame with zip, heat_hhb (from HHB_SCORE), nbe_score, hhi_overall
     """
-    df = pd.read_excel(file_path, dtype={'ZCTA': str})
+    df = pd.read_excel(file_path, dtype={'ZCTA': str}, skiprows=skip_rows)
     if 'ZCTA' not in df.columns:
         raise ValueError("HHI Excel must contain 'ZCTA' column.")
     df['zip'] = (
@@ -95,9 +95,9 @@ def read_hhi_excel(file_path):
 # =============================================================================
 
 @cache_data
-def read_population_data(file_path):
+def read_population_data(file_path, skip_rows=10):
     """Read population density and location data."""
-    df = pd.read_csv(file_path, skiprows=10)
+    df = pd.read_csv(file_path, skiprows=skip_rows)
     df.columns = [str(c).strip() for c in df.columns]
     lower = {c.lower(): c for c in df.columns}
     required = ["zip", "population", "density", "lat", "long"]
@@ -245,13 +245,17 @@ def read_pharmacy_data(file_path):
 # =============================================================================
 
 @cache_data
-def read_hud_zip_county_crosswalk(path):
+def read_hud_zip_county_crosswalk(path, skip_rows=0):
     """
     Read HUD ZIP↔County crosswalk; return [zip, county, state, weight].
     Uses TOT_RATIO if present else RES_RATIO.
     """
     ext = os.path.splitext(path)[1].lower()
-    df = pd.read_excel(path, dtype=str) if ext in (".xlsx", ".xls") else pd.read_csv(path, dtype=str, low_memory=False)
+    df = (
+        pd.read_excel(path, dtype=str, skiprows=skip_rows)
+        if ext in (".xlsx", ".xls")
+        else pd.read_csv(path, dtype=str, low_memory=False, skiprows=skip_rows)
+    )
     cols = {c.lower(): c for c in df.columns}
     zip_col = cols.get("zip") or cols.get("zipcode") or cols.get("zip_code")
     county_col = cols.get("county") or cols.get("county_fips") or cols.get("fips")
@@ -270,11 +274,11 @@ def read_hud_zip_county_crosswalk(path):
 
 
 @cache_data
-def read_county_desert_csv(path):
+def read_county_desert_csv(path, skip_rows=0):
     """
     Read county-level desert dataset; return [county, county_desert, drive_time_min, desert_pop_pct].
     """
-    df = pd.read_csv(path, dtype=str, low_memory=False)
+    df = pd.read_csv(path, dtype=str, low_memory=False, skiprows=skip_rows)
     fips_col = next((c for c in df.columns if "fips" in c.lower()), None)
     if not fips_col:
         raise ValueError("County dataset must include a county FIPS column.")
@@ -557,4 +561,3 @@ def get_pharmacists_for_zip(zip_code, pharmacist_df):
     pharmacists.sort(key=lambda x: (not x[1], x[0].lower()))
 
     return pharmacists
-

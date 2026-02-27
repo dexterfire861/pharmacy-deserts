@@ -49,7 +49,104 @@ def average_scores(math_df: pd.DataFrame, ai_df: pd.DataFrame, normalize: bool =
 
 
 # =============================================================================
-# NEW FLEXIBLE SCORING SYSTEM
+# FEATURE-BASED SCORING SYSTEM (Modular - weights for any feature)
+# =============================================================================
+
+def score_with_features(
+    df: pd.DataFrame,
+    feature_weights: Dict[str, float],
+    exclude_columns: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Score using direct feature weights - no component mapping needed.
+    
+    This is the modular scoring approach where:
+    - Any numeric feature column can be weighted
+    - Weights are applied directly to normalized features
+    - No preset components - fully flexible
+    
+    Args:
+        df: DataFrame with feature columns
+        feature_weights: Dict of feature_column_name -> weight (0.0 to 1.0)
+        exclude_columns: Columns to exclude from scoring (e.g., 'zcta5', 'zip', 'city', 'state', 'latitude', 'longitude')
+    
+    Returns:
+        Scored DataFrame with 'score' column added
+    """
+    if exclude_columns is None:
+        exclude_columns = ['zcta5', 'zip', 'city', 'state', 'latitude', 'longitude', 'lat', 'lon']
+    
+    df = df.copy()
+    
+    # Get numeric columns that are in weights and not excluded
+    available_features = []
+    for col in df.columns:
+        if col in feature_weights and col not in exclude_columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                available_features.append(col)
+    
+    if not available_features:
+        df['score'] = 0.0
+        return df
+    
+    # Normalize each feature to [0, 1] and apply weights
+    score_components = []
+    for feature in available_features:
+        weight = feature_weights[feature]
+        if weight <= 0:
+            continue
+        
+        values = pd.to_numeric(df[feature], errors='coerce')
+        if values.isna().all():
+            continue
+        
+        # Normalize to [0, 1]
+        normalized = norm01(values)
+        
+        # Weighted contribution
+        score_components.append(normalized * weight)
+    
+    if not score_components:
+        df['score'] = 0.0
+    else:
+        # Sum weighted components
+        df['score'] = pd.concat(score_components, axis=1).sum(axis=1)
+        
+        # Normalize final score to [0, 1]
+        df['score'] = norm01(df['score'])
+    
+    return df
+
+
+def get_available_features_for_weighting(
+    df: pd.DataFrame,
+    exclude_columns: Optional[List[str]] = None
+) -> List[str]:
+    """
+    Get list of numeric feature columns available for weighting.
+    
+    Args:
+        df: DataFrame to analyze
+        exclude_columns: Columns to exclude (metadata, geo, etc.)
+    
+    Returns:
+        List of feature column names
+    """
+    if exclude_columns is None:
+        exclude_columns = ['zcta5', 'zip', 'city', 'state', 'latitude', 'longitude', 'lat', 'lon', 'score', 'desert_flag']
+    
+    features = []
+    for col in df.columns:
+        if col not in exclude_columns and pd.api.types.is_numeric_dtype(df[col]):
+            # Skip if all NaN
+            if not df[col].isna().all():
+                features.append(col)
+    
+    return sorted(features)
+
+
+# =============================================================================
+# LEGACY COMPONENT-BASED SCORING (for backwards compatibility)
 # =============================================================================
 
 def score_with_config(
@@ -210,6 +307,9 @@ def get_available_weights_for_dataset(
     
     Returns dict of component_name -> (display_name, default_weight)
     Used by the UI to show only relevant weight sliders.
+    
+    NOTE: This is the legacy component-based approach.
+    For new feature-based scoring, use get_available_features_for_weighting().
     """
     col_map = {m.target_component: m.source_column for m in config.column_mappings}
     available = {}
@@ -235,41 +335,100 @@ def score_candidates(
     w_pop: float,
     w_heat: float = 0.0,
     w_edu: float = 0.0,
-    w_drive_time: float = 0.0
+    w_drive_time: float = 0.0,
+    extra_feature_weights: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
-    Apply mathematical scoring model (LEGACY - for backwards compatibility).
-    
-    This function expects the original hardcoded column names.
-    For new datasets with different columns, use score_with_config().
+    Apply mathematical scoring model with named weight parameters.
+
+    Each component is min-max normalized to [0,1], multiplied by its weight,
+    summed, and the final score is rescaled to [0,1].
 
     Args:
-        df: Preprocessed DataFrame with standard column names
-        w_scarcity: Weight for pharmacy scarcity
-        w_health: Weight for health burden
-        w_income: Weight for income (inverted)
+        df: Preprocessed DataFrame (output of preprocess / unified dataset)
+        w_scarcity: Weight for pharmacy scarcity (1/(1+n_pharmacies))
+        w_health: Weight for health burden (higher = worse)
+        w_income: Weight for income (inverted — lower income = higher score)
         w_pop: Weight for population density
-        w_heat: Weight for heat vulnerability
-        w_edu: Weight for education (low attainment)
-        w_drive_time: Weight for driving time to nearest pharmacy
+        w_heat: Weight for heat vulnerability (HHI)
+        w_edu: Weight for low education attainment
+        w_drive_time: Weight for drive time to pharmacy
+        extra_feature_weights: Optional mapping of additional numeric
+            feature column -> weight. These are normalized and added
+            into the same weighted math score.
 
     Returns:
-        Scored and sorted DataFrame
+        Scored and sorted DataFrame with 'score' and 'desert_flag' columns
     """
-    # Use the flexible system with default config and explicit weights
-    config = get_default_scoring_config()
-    
-    weights = {
-        "pharmacy_count": w_scarcity,
-        "health_burden": w_health,
-        "income": w_income,
-        "pop_density": w_pop,
-        "heat_vulnerability": w_heat,
-        "education_low": w_edu,
-        "drive_time": w_drive_time,
-    }
-    
-    return score_with_config(df, config, weights)
+    df = df.copy()
+    df['median_income'] = pd.to_numeric(df.get('median_income'), errors='coerce')
+    df['health_burden'] = pd.to_numeric(df.get('health_burden'), errors='coerce')
+    df['pop_density'] = pd.to_numeric(df.get('pop_density'), errors='coerce').fillna(0)
+
+    df['scarcity'] = 1 / (1 + df['n_pharmacies'])
+    df['scarcity_n'] = norm01(df['scarcity'])
+    df['health_n'] = norm01(df['health_burden'])
+    df['income_inv'] = 1 - norm01(df['median_income'])
+    df['pop_norm'] = norm01(df['pop_density'])
+
+    if 'edu_hs_or_lower_pct' in df.columns:
+        df['edu_low_norm'] = norm01(df['edu_hs_or_lower_pct'])
+    else:
+        df['edu_low_norm'] = 0.0
+        w_edu = 0.0
+
+    if 'zip_drive_time' in df.columns and df['zip_drive_time'].notna().any():
+        df['drive_time_norm'] = norm01(df['zip_drive_time'])
+        df['drive_time_norm'] = df['drive_time_norm'].fillna(
+            df['drive_time_norm'].median(skipna=True)
+        )
+    else:
+        df['drive_time_norm'] = 0.0
+        w_drive_time = 0.0
+
+    if 'heat_hhb' in df.columns:
+        df['heat_norm'] = norm01(df['heat_hhb'])
+    else:
+        df['heat_norm'] = 0.0
+        w_heat = 0.0
+
+    drive_score = df['drive_time_norm'] if w_drive_time > 0 else 0
+    scar_score = df['scarcity_n'].fillna(0) if w_scarcity > 0 else 0
+    hlth_score = df['health_n'].fillna(0) if w_health > 0 else 0
+    inc_score = df['income_inv'].fillna(0) if w_income > 0 else 0
+    pop_score = df['pop_norm'].fillna(0) if w_pop > 0 else 0
+    heat_score = df['heat_norm'] if w_heat > 0 else 0
+    edu_score = df['edu_low_norm'].fillna(0) if w_edu > 0 else 0
+
+    df['score'] = (
+        w_drive_time * drive_score
+        + w_scarcity * scar_score
+        + w_health * hlth_score
+        + w_income * inc_score
+        + w_pop * pop_score
+        + w_heat * heat_score
+        + w_edu * edu_score
+    )
+
+    if extra_feature_weights:
+        for feature_col, feature_weight in extra_feature_weights.items():
+            try:
+                w = float(feature_weight)
+            except Exception:
+                continue
+            if w <= 0 or feature_col not in df.columns:
+                continue
+            values = pd.to_numeric(df[feature_col], errors='coerce')
+            if values.notna().sum() == 0:
+                continue
+            df['score'] = df['score'] + (w * norm01(values).fillna(0))
+
+    smin, smax = df['score'].min(), df['score'].max()
+    if smax > smin:
+        df['score'] = (df['score'] - smin) / (smax - smin)
+
+    df['desert_flag'] = (df['n_pharmacies'] == 0).astype(int)
+    return df.sort_values(['desert_flag', 'score'], ascending=[False, False])
 
 
 def score_candidates_legacy(

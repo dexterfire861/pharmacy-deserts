@@ -77,58 +77,74 @@ def export_training_data(
     dataset_version: str = None
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    Export merged training data from a dataset configuration.
-    
-    This loads all sources from the dataset config, merges them on ZCTA5,
-    and exports a single CSV ready for training.
-    
+    Export the unified dataset as a training-ready CSV.
+
+    Loads the pre-merged unified CSV, strips metadata and geo columns,
+    and writes a training CSV to *output_path*.
+
     Args:
         dataset_id: Dataset identifier
-        output_path: Path to write the merged CSV
+        output_path: Path to write the training CSV
         dataset_version: Specific version (uses LATEST if not specified)
-        
+
     Returns:
         Tuple of (output_path, metadata dict)
     """
     from ingestion.dataset_loader import load_dataset_from_config
     from storage.datasets import get_storage
-    
-    # Load the dataset
+
     logger.info(f"Loading dataset {dataset_id} (version: {dataset_version or 'LATEST'})")
     df, scoring_config = load_dataset_from_config(
-        dataset_id, 
+        dataset_id,
         version_id=dataset_version,
         include_scoring_config=True
     )
-    
-    # Get dataset config for metadata
+
     storage = get_storage()
     if dataset_version is None:
         dataset_version = storage.get_latest_version(dataset_id)
-    
+
     dataset_config = storage.get_config(dataset_id, dataset_version)
-    
-    # Extract source filenames
     data_sources = [s.get('filename', 'unknown') for s in dataset_config.get('sources', [])]
-    
-    # Get feature columns (excluding zcta5 and geo columns)
-    geo_cols = ['latitude', 'longitude', 'lat', 'lon', 'long']
-    feature_columns = [c for c in df.columns if c != 'zcta5' and c.lower() not in geo_cols]
-    
-    # Export to CSV
-    logger.info(f"Exporting {len(df)} rows to {output_path}")
+
+    # Metadata columns stored at dataset level (unified format) or per-source (legacy)
+    metadata_cols: list[str] = list(dataset_config.get('metadata_columns', []))
+    for source in dataset_config.get('sources', []):
+        for col in source.get('metadata_columns', []):
+            if col not in metadata_cols:
+                metadata_cols.append(col)
+        renames = source.get('column_renames', {})
+        for old_name, new_name in renames.items():
+            if old_name in metadata_cols and new_name not in metadata_cols:
+                metadata_cols.append(new_name)
+
+    geo_names = {'latitude', 'longitude', 'lat', 'lon', 'long', 'lng'}
+
+    feature_columns = [
+        c for c in df.columns
+        if c not in ('zcta5', 'zip')
+        and c.lower() not in geo_names
+        and c not in metadata_cols
+    ]
+
+    logger.info(
+        f"Training features: {len(feature_columns)} | "
+        f"Excluded metadata: {metadata_cols} | Excluded geo: {geo_names & set(c.lower() for c in df.columns)}"
+    )
+
     df.to_csv(output_path, index=False)
-    
+    logger.info(f"Exported {len(df)} rows to {output_path}")
+
     metadata = {
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
         "data_sources": data_sources,
         "row_count": len(df),
         "feature_columns": feature_columns,
+        "metadata_columns_excluded": metadata_cols,
         "columns": list(df.columns),
         "exported_at": datetime.utcnow().isoformat()
     }
-    
     return output_path, metadata
 
 
@@ -200,61 +216,51 @@ def trigger_training(
         training_config.save(str(config_path))
         
         # Step 3: Run training script
-        # NOTE: This is where the ML partner's code gets called
-        # The training script should be adapted to accept this config
         logger.info("Step 3: Running training script...")
         start_time = time.time()
-        
-        # For now, we'll just run the existing script with environment variables
-        # ML partner should adapt new_training.py to use the config file
+
         training_script = Path(__file__).parent.parent / "new_training.py"
-        
+
         if training_script.exists():
-            # Set environment variables for the training script
             env = os.environ.copy()
             env["TRAINING_CONFIG"] = str(config_path)
             env["TRAINING_DATA"] = str(data_path)
             env["TRAINING_OUTPUT"] = str(output_dir)
-            
-            # Run training (this is a placeholder - partner will adapt)
-            # For now, skip actual training if script isn't adapted
-            logger.warning(
-                "Training script exists but may not be adapted for config-based training. "
-                "ML Partner: Please update new_training.py to read from TRAINING_CONFIG env var."
+
+            result = subprocess.run(
+                ["python", str(training_script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,
             )
-            
-            # Placeholder: Copy existing results if available
-            existing_results = Path("results")
-            if existing_results.exists():
-                import shutil
-                for f in existing_results.glob("*.csv"):
-                    shutil.copy(f, output_dir / f.name)
-                logger.info("Copied existing results as placeholder")
-        
+
+            if result.returncode != 0:
+                logger.error(f"Training script failed (exit {result.returncode}):\n{result.stderr}")
+                raise RuntimeError(
+                    f"Training script exited with code {result.returncode}. "
+                    f"stderr: {result.stderr[:500]}"
+                )
+
+            logger.info(f"Training script completed. stdout: {result.stdout[:200]}")
+        else:
+            logger.warning("No training script (new_training.py) found — skipping model fit")
+
         training_duration = time.time() - start_time
-        
+
         # Step 4: Collect results and metrics
         logger.info("Step 4: Collecting results...")
         result_files = {}
-        metrics = {}
-        
-        # Look for output files
         for result_file in output_dir.glob("*"):
             if result_file.is_file():
                 result_files[result_file.name] = result_file.read_bytes()
-        
-        # Look for metrics file
+
+        metrics: Dict[str, Any] = {}
         metrics_file = output_dir / "metrics.json"
         if metrics_file.exists():
             with open(metrics_file) as f:
                 metrics = json.load(f)
-        else:
-            # Placeholder metrics
-            metrics = {
-                "status": "placeholder",
-                "note": "Training script not yet adapted for automated metrics"
-            }
-        
+
         metrics["training_duration_sec"] = training_duration
         
         # Step 5: Save to model registry

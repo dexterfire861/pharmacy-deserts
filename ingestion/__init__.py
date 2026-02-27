@@ -1,6 +1,6 @@
 # pharmacy_deserts/ingestion/__init__.py
 """
-Data ingestion utilities for parsing, normalizing, loading datasets, and API connectors.
+Data ingestion utilities for parsing, normalizing, and loading datasets.
 """
 from .parsers import (
     get_file_type,
@@ -33,20 +33,6 @@ from .dataset_loader import (
     get_dataset_info,
     list_available_datasets,
 )
-from .api_connectors import (
-    APISourceConfig,
-    BaseAPIConnector,
-    CensusACSConnector,
-    HUDConnector,
-    CustomAPIConnector,
-    CENSUS_PRESETS,
-    US_STATES,
-    CONNECTORS,
-    get_connector,
-    list_connectors,
-    list_census_presets,
-)
-
 __all__ = [
     # Parsers
     'get_file_type',
@@ -76,16 +62,4 @@ __all__ = [
     'get_active_dataset_id',
     'get_dataset_info',
     'list_available_datasets',
-    # API Connectors
-    'APISourceConfig',
-    'BaseAPIConnector',
-    'CensusACSConnector',
-    'HUDConnector',
-    'CustomAPIConnector',
-    'CENSUS_PRESETS',
-    'US_STATES',
-    'CONNECTORS',
-    'get_connector',
-    'list_connectors',
-    'list_census_presets',
 ]

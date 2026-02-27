@@ -269,6 +269,7 @@ class ScoringConfig:
     """
     column_mappings: List[ColumnMapping] = field(default_factory=list)
     weight_overrides: Dict[str, float] = field(default_factory=dict)
+    custom_feature_weights: Dict[str, float] = field(default_factory=dict)
     desert_threshold: float = 2.0  # pharmacies per 10k for desert flag
     normalize_scores: bool = True
     
@@ -310,6 +311,7 @@ class ScoringConfig:
         return {
             "column_mappings": [m.to_dict() for m in self.column_mappings],
             "weight_overrides": self.weight_overrides,
+            "custom_feature_weights": self.custom_feature_weights,
             "desert_threshold": self.desert_threshold,
             "normalize_scores": self.normalize_scores,
         }
@@ -320,6 +322,7 @@ class ScoringConfig:
         return cls(
             column_mappings=mappings,
             weight_overrides=d.get("weight_overrides", {}),
+            custom_feature_weights=d.get("custom_feature_weights", {}),
             desert_threshold=d.get("desert_threshold", 2.0),
             normalize_scores=d.get("normalize_scores", True),
         )
@@ -345,6 +348,7 @@ def get_default_scoring_config() -> ScoringConfig:
             ColumnMapping("lon", "longitude"),
         ],
         weight_overrides={},  # Use defaults
+        custom_feature_weights={},
         desert_threshold=2.0,
     )
 
@@ -370,5 +374,5 @@ def create_scoring_config_from_mappings(
     return ScoringConfig(
         column_mappings=column_mappings,
         weight_overrides=weight_overrides or {},
+        custom_feature_weights={},
     )
-

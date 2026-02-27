@@ -13,6 +13,7 @@ import numpy as np
 from pathlib import Path
 import sys
 import os
+import io
 import logging
 
 logger = logging.getLogger(__name__)
@@ -350,16 +351,17 @@ def load_glm_results():
 @st.cache_data(show_spinner="Loading location data...")
 def load_latlon_lookup():
     """
-    Load minimal lat/lon lookup table from population data.
+    Load minimal lat/lon lookup table.
     
-    This is used in GLM Only mode when GLM results don't include lat/lon.
-    Much lighter than loading the full math dataset bundle.
+    Tries population_data.csv first, then falls back to the unified dataset.
     
     Returns:
-        DataFrame with columns: zip, lat, lon (empty if file not found)
+        DataFrame with columns: zip, lat, lon (empty if no source found)
     """
     config = get_config()
-    
+    empty = pd.DataFrame(columns=["zip", "lat", "lon"])
+
+    # --- Attempt 1: population_data.csv (legacy raw file) ---
     try:
         if _is_s3_environment():
             from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
@@ -371,27 +373,45 @@ def load_latlon_lookup():
             df = pd.read_csv(io.BytesIO(data), skiprows=10)
         else:
             population_path = Path('raw_data/population_data.csv')
-            if not population_path.exists():
-                logger.warning(f"Population data file not found: {population_path}")
-                return pd.DataFrame(columns=["zip", "lat", "lon"])
-            df = pd.read_csv(population_path, skiprows=10)
-        
-        df.columns = [str(c).strip() for c in df.columns]
-        lower = {c.lower(): c for c in df.columns}
-        
-        if not all(k in lower for k in ["zip", "lat", "long"]):
-            return pd.DataFrame(columns=["zip", "lat", "lon"])
-        
-        out = pd.DataFrame({
-            "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
-            "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
-            "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
-        })
-        
-        return out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+            if population_path.exists():
+                df = pd.read_csv(population_path, skiprows=10)
+            else:
+                df = None
+
+        if df is not None:
+            df.columns = [str(c).strip() for c in df.columns]
+            lower = {c.lower(): c for c in df.columns}
+            if all(k in lower for k in ["zip", "lat", "long"]):
+                out = pd.DataFrame({
+                    "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+                    "lat": pd.to_numeric(df[lower["lat"]], errors="coerce"),
+                    "lon": pd.to_numeric(df[lower["long"]], errors="coerce"),
+                })
+                out = out.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+                if not out.empty:
+                    return out
     except Exception as e:
-        logger.warning(f"Failed to load lat/lon lookup: {e}")
-        return pd.DataFrame(columns=["zip", "lat", "lon"])
+        logger.warning(f"Population file lat/lon load failed: {e}")
+
+    # --- Attempt 2: unified dataset (has lat/lon from preprocessing) ---
+    try:
+        from storage.datasets import get_storage
+        storage = get_storage()
+        version_id = storage.get_latest_version("pharmacy_data")
+        if version_id:
+            raw = storage.download_unified_dataset("pharmacy_data", version_id)
+            udf = pd.read_csv(io.BytesIO(raw), dtype={"zip": str}, usecols=lambda c: c in ("zip", "lat", "lon"))
+            if {"zip", "lat", "lon"}.issubset(udf.columns):
+                udf["zip"] = udf["zip"].astype(str).str.zfill(5)
+                udf["lat"] = pd.to_numeric(udf["lat"], errors="coerce")
+                udf["lon"] = pd.to_numeric(udf["lon"], errors="coerce")
+                out = udf.dropna(subset=["zip", "lat", "lon"]).drop_duplicates(subset=["zip"])
+                if not out.empty:
+                    return out
+    except Exception as e:
+        logger.warning(f"Unified dataset lat/lon load failed: {e}")
+
+    return empty
 
 
 @st.cache_data(show_spinner="Loading pharmacist data...")
@@ -500,53 +520,57 @@ def load_dataset_from_config_cached(dataset_id: str, version_id: str = None):
     return df, scoring_config_dict
 
 
-@st.cache_data(show_spinner="Loading smart dataset bundle...")
-def load_smart_dataset_bundle(active_dataset_id: str = ""):
+@st.cache_data(show_spinner="Loading dataset...")
+def load_smart_dataset_bundle(active_dataset_id: str = "", dataset_version_hint: str = ""):
     """
-    Smart dataset loader that loads from dataset config if ID provided.
-    
+    Load the active dataset for the app.
+
+    If *active_dataset_id* points to an uploaded (unified) dataset, that dataset
+    IS the complete data — no merging with a default bundle is needed.
+
+    Falls back to the built-in default dataset when no uploaded data exists.
+
     Args:
-        active_dataset_id: Dataset ID to load (empty string for default)
-    
+        active_dataset_id: Dataset ID to load (empty string for default only)
+        dataset_version_hint: Optional version ID to include in the cache key
+
     Returns:
-        tuple: (merged_df, pharmacist_data, scoring_config_dict or None)
+        tuple: (df, pharmacist_data, scoring_config_dict or None)
     """
+    from models.schema import get_default_scoring_config
+
+    # ------------------------------------------------------------------
+    # If an uploaded dataset exists, load it directly (unified CSV)
+    # ------------------------------------------------------------------
     if active_dataset_id:
-        logger.info(f"Loading from dataset config: {active_dataset_id}")
-        
+        logger.info(f"Loading uploaded dataset: {active_dataset_id}")
         try:
-            # Load the configured dataset with scoring config
-            df, scoring_config_dict = load_dataset_from_config_cached(active_dataset_id)
-            
-            # Still need pharmacist data from default source
+            version_id = dataset_version_hint or None
+            uploaded_df, scoring_config_dict = load_dataset_from_config_cached(
+                active_dataset_id, version_id=version_id
+            )
+            logger.info(f"Uploaded dataset: {len(uploaded_df)} rows, {len(uploaded_df.columns)} columns")
+
             pharmacist_data = load_pharmacist_data_only()
-            
-            return df, pharmacist_data, scoring_config_dict
+            return uploaded_df, pharmacist_data, scoring_config_dict
         except (ValueError, FileNotFoundError) as e:
-            # Dataset doesn't exist yet - return empty
-            logger.warning(f"Dataset '{active_dataset_id}' not found: {e}")
-            from models.schema import get_default_scoring_config
-            empty_df = pd.DataFrame(columns=['zip', 'zcta5'])
-            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
-            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
-    else:
-        # Fall back to default loading (returns default scoring config)
-        # But first check if default files exist
-        if not Path('raw_data/financial_data.csv').exists():
-            # No default data available - return empty with default config
-            logger.warning("No default raw_data files found and no dataset selected")
-            from models.schema import get_default_scoring_config
-            empty_df = pd.DataFrame(columns=['zip'])
-            empty_pharmacist = pd.DataFrame(columns=['Short_ZIP'])
-            return empty_df, empty_pharmacist, get_default_scoring_config().to_dict()
-        
-        df, pharmacist_data = load_math_dataset_bundle()
-        
-        # Get default scoring config
-        from models.schema import get_default_scoring_config
+            logger.warning(f"Dataset '{active_dataset_id}' not found: {e}. Falling back to default.")
+
+    # ------------------------------------------------------------------
+    # Fallback: load built-in default dataset from raw_data/
+    # ------------------------------------------------------------------
+    logger.info("Loading default dataset from raw_data/")
+    default_files_exist = Path('raw_data/financial_data.csv').exists()
+
+    if not default_files_exist:
+        logger.warning("No default raw_data files found")
         default_config = get_default_scoring_config()
-        
-        return df, pharmacist_data, default_config.to_dict()
+        return pd.DataFrame(columns=['zip']), pd.DataFrame(columns=['Short_ZIP']), default_config.to_dict()
+
+    default_df, default_pharmacist = load_math_dataset_bundle()
+    default_config = get_default_scoring_config()
+    pharmacist_data = default_pharmacist if not default_pharmacist.empty else load_pharmacist_data_only()
+    return default_df, pharmacist_data, default_config.to_dict()
 
 
 def get_scoring_config_object(scoring_config_dict):

@@ -15,45 +15,70 @@ except ImportError:
         return ""  # Fallback if health data not available
 
 
+def _parse_city_state_from_csv(path, skiprows=10):
+    """Extract zip/city/state from a population CSV file."""
+    df = pd.read_csv(path, skiprows=skiprows)
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+
+    if "zip" not in lower:
+        return pd.DataFrame(columns=["zip", "city", "state"])
+
+    city_col = lower.get("city") or lower.get("place")
+    state_col = lower.get("state") or lower.get("st")
+
+    result = pd.DataFrame({
+        "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+        "city": df[city_col].astype(str) if city_col else "",
+        "state": df[state_col].astype(str) if state_col else "",
+    })
+    return result.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+
+
 def _get_population_labels():
     """
-    Get population labels from local or S3 based on environment.
-    Returns empty DataFrame if file not found (map will work but without city/state labels).
+    Get population labels (city/state) for ZIP codes.
+    Tries legacy path first, then falls back to uploaded dataset files.
     """
     config = get_config()
-    
+    empty = pd.DataFrame(columns=["zip", "city", "state"])
+
+    # --- Attempt 1: S3 or legacy local file ---
     try:
         if config.is_production and config.aws_s3_bucket:
-            # Load from S3
             from data.s3_loaders import parse_s3_path, download_s3_file_to_memory
             import io
-            
             s3_path = config.get_population_data_path()
             bucket, key = parse_s3_path(s3_path)
             data = download_s3_file_to_memory(bucket, key)
-            
-            df = pd.read_csv(io.BytesIO(data), skiprows=10)
-            df.columns = [str(c).strip() for c in df.columns]
-            lower = {c.lower(): c for c in df.columns}
-            
-            result = pd.DataFrame({
-                "zip": df[lower["zip"]].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
-                "city": df[lower.get("city", lower.get("place", "zip"))].astype(str) if "city" in lower or "place" in lower else "",
-                "state": df[lower.get("state", lower.get("st", "zip"))].astype(str) if "state" in lower or "st" in lower else "",
-            })
-            return result.dropna(subset=["zip"]).drop_duplicates(subset=["zip"])
+            result = _parse_city_state_from_csv(io.BytesIO(data))
+            if not result.empty:
+                return result
         else:
-            # Load from local filesystem - check if file exists first
-            from pathlib import Path
             local_path = Path('raw_data/population_data.csv')
-            if not local_path.exists():
-                # Return empty DataFrame - map will work but without city/state labels
-                return pd.DataFrame(columns=["zip", "city", "state"])
-            return read_population_labels(str(local_path))
+            if local_path.exists():
+                result = read_population_labels(str(local_path))
+                if not result.empty:
+                    return result
     except Exception as e:
-        # If anything fails, return empty DataFrame
-        print(f"Warning: Could not load population labels: {e}")
-        return pd.DataFrame(columns=["zip", "city", "state"])
+        print(f"Warning: Legacy population labels failed: {e}")
+
+    # --- Attempt 2: uploaded population file inside dataset version ---
+    try:
+        import json
+        latest_path = Path('raw_data/datasets/pharmacy_data/LATEST.json')
+        if latest_path.exists():
+            ver = json.loads(latest_path.read_text()).get('latest_version')
+            if ver:
+                uploaded = Path(f'raw_data/datasets/pharmacy_data/versions/{ver}/files/population_data.csv')
+                if uploaded.exists():
+                    result = _parse_city_state_from_csv(uploaded)
+                    if not result.empty:
+                        return result
+    except Exception as e:
+        print(f"Warning: Uploaded population labels failed: {e}")
+
+    return empty
 
 
 def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
@@ -111,10 +136,33 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
     
     # Standardize column names if found
     if has_latlon_cols:
+        # Handle potential duplicate column names from merging
         if lat_col != 'lat':
-            top10['lat'] = top10[lat_col]
+            # Ensure we get a Series, not a DataFrame (handle duplicate column names)
+            lat_series = top10[lat_col]
+            if isinstance(lat_series, pd.DataFrame):
+                # If multiple columns match, take the first one
+                lat_series = lat_series.iloc[:, 0]
+            # Remove any existing 'lat' column to avoid duplicates
+            if 'lat' in top10.columns:
+                top10 = top10.drop(columns=['lat'])
+            top10['lat'] = lat_series
         if lon_col != 'lon':
-            top10['lon'] = top10[lon_col]
+            # Ensure we get a Series, not a DataFrame (handle duplicate column names)
+            lon_series = top10[lon_col]
+            if isinstance(lon_series, pd.DataFrame):
+                # If multiple columns match, take the first one
+                lon_series = lon_series.iloc[:, 0]
+            # Remove any existing 'lon' column to avoid duplicates
+            if 'lon' in top10.columns:
+                top10 = top10.drop(columns=['lon'])
+            top10['lon'] = lon_series
+        
+        # Ensure lat and lon are proper Series (not DataFrames)
+        if 'lat' in top10.columns and isinstance(top10['lat'], pd.DataFrame):
+            top10['lat'] = top10['lat'].iloc[:, 0]
+        if 'lon' in top10.columns and isinstance(top10['lon'], pd.DataFrame):
+            top10['lon'] = top10['lon'].iloc[:, 0]
     
     has_any_points = has_latlon_cols and top10[["lat","lon"]].notna().any().any()
     
@@ -138,12 +186,82 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
         import folium
         from streamlit_folium import st_folium
         pts = top10.dropna(subset=["lat","lon"]).copy()
-        fmap = folium.Map(location=[float(pts["lat"].mean()), float(pts["lon"].mean())], zoom_start=4, control_scale=True)
-        bounds = pts[["lat","lon"]].values.tolist()
+        
+        # Clean up duplicate columns before processing
+        # When merging datasets, duplicate column names can cause issues
+        # Remove duplicates, keeping only the first occurrence of each column name
+        if pts.columns.duplicated().any():
+            # Get unique column names, keeping first occurrence
+            unique_cols = []
+            seen = set()
+            for col in pts.columns:
+                if col not in seen:
+                    unique_cols.append(col)
+                    seen.add(col)
+            pts = pts[unique_cols]
+        
+        # Ensure 'lat' and 'lon' exist and are Series (not DataFrame)
+        if 'lat' in pts.columns:
+            if isinstance(pts['lat'], pd.DataFrame):
+                # If DataFrame, take first column
+                pts['lat'] = pts['lat'].iloc[:, 0]
+        
+        if 'lon' in pts.columns:
+            if isinstance(pts['lon'], pd.DataFrame):
+                # If DataFrame, take first column
+                pts['lon'] = pts['lon'].iloc[:, 0]
+        
+        # Ensure lat and lon are proper Series (not DataFrame) - handle duplicate columns from merging
+        lat_series = pts["lat"]
+        lon_series = pts["lon"]
+        
+        if isinstance(lat_series, pd.DataFrame):
+            lat_series = lat_series.iloc[:, 0]
+        if isinstance(lon_series, pd.DataFrame):
+            lon_series = lon_series.iloc[:, 0]
+        
+        # Convert to numeric and get mean
+        lat_mean = float(pd.to_numeric(lat_series, errors='coerce').mean())
+        lon_mean = float(pd.to_numeric(lon_series, errors='coerce').mean())
+        
+        fmap = folium.Map(location=[lat_mean, lon_mean], zoom_start=4, control_scale=True)
+        
+        # Get bounds safely (ensure we have Series, not DataFrame)
+        bounds_df = pts[["lat","lon"]].copy()
+        # If lat or lon are DataFrames, extract first column
+        if isinstance(bounds_df["lat"], pd.DataFrame):
+            bounds_df["lat"] = bounds_df["lat"].iloc[:, 0]
+        if isinstance(bounds_df["lon"], pd.DataFrame):
+            bounds_df["lon"] = bounds_df["lon"].iloc[:, 0]
+        
+        bounds = bounds_df[["lat","lon"]].values.tolist()
         if bounds: fmap.fit_bounds(bounds, padding=(20, 20))
 
         for _, r in pts.iterrows():
-            lat, lon = float(r["lat"]), float(r["lon"])
+            # Safely extract lat/lon values (handle duplicate columns from merging)
+            # Use .get() with default, then check if it's a Series
+            lat_val = r.get("lat")
+            lon_val = r.get("lon")
+            
+            # Handle case where duplicate columns cause Series return
+            if isinstance(lat_val, pd.Series):
+                lat_val = lat_val.iloc[0] if len(lat_val) > 0 else None
+            elif lat_val is None:
+                continue
+            
+            if isinstance(lon_val, pd.Series):
+                lon_val = lon_val.iloc[0] if len(lon_val) > 0 else None
+            elif lon_val is None:
+                continue
+            
+            # Convert to float safely
+            try:
+                lat = float(pd.to_numeric(lat_val, errors='coerce'))
+                lon = float(pd.to_numeric(lon_val, errors='coerce'))
+                if pd.isna(lat) or pd.isna(lon):
+                    continue  # Skip if conversion resulted in NaN
+            except (ValueError, TypeError):
+                continue  # Skip this row if lat/lon can't be converted
             place = (f'{r.get("city","")}, {r.get("state","")}'.strip(", ") or "(unknown)")
             drive_time_html = ""
             if ('zip_drive_time' in r.index) and pd.notna(r.get('zip_drive_time')):
@@ -221,7 +339,7 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
                         <b>Math score:</b> {r.get('score_math', float('nan')):.3f}<br>
                         <b>AI score:</b> {r.get('ai_score', float('nan')):.3f}<br>
                         <b>Pharmacies:</b> {int(r.get('n_pharmacies', r.get('pharmacies_count', 0)))}<br>
-                        <b>Pop density:</b> {r['pop_density']:.1f}
+                        <b>Pop density:</b> {r.get('pop_density', r.get('density', 0)):.1f}
                         {health_html}
                         {pharmacist_html}
                     """, width=popup_width, height=popup_height + 80
@@ -238,6 +356,22 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None):
         st_folium(fmap, width=None, key="pharmacy_map", returned_objects=[])
     except ModuleNotFoundError:
         st.info("For labeled markers, install: `pip install folium streamlit-folium`. Showing basic map instead.")
-        st.map(top10.dropna(subset=["lat","lon"])[["lat","lon"]], zoom=4, use_container_width=True)
+        # Create a clean DataFrame with just lat/lon for st.map()
+        map_data = top10.dropna(subset=["lat","lon"]).copy()
+        # Ensure we have clean lat/lon columns (handle duplicate column names)
+        if 'lat' in map_data.columns and 'lon' in map_data.columns:
+            # Get lat/lon as Series, handling potential duplicates
+            lat_series = map_data['lat']
+            lon_series = map_data['lon']
+            if isinstance(lat_series, pd.DataFrame):
+                lat_series = lat_series.iloc[:, 0]
+            if isinstance(lon_series, pd.DataFrame):
+                lon_series = lon_series.iloc[:, 0]
+            # Create clean DataFrame with unique column names
+            clean_map_data = pd.DataFrame({
+                'lat': lat_series,
+                'lon': lon_series
+            })
+            st.map(clean_map_data, zoom=4, use_container_width=True)
         keep = [c for c in ["zip","place","final_score","score_math","ai_score","n_pharmacies","pop_density"] if c in top10.columns]
         st.dataframe(top10[keep])

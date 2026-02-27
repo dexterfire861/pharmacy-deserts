@@ -11,13 +11,39 @@ import hashlib
 
 
 def generate_version_id() -> str:
-    """Generate a unique version ID based on timestamp."""
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    """Generate a unique version ID with sub-second precision."""
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def get_file_hash(file_bytes: bytes) -> str:
     """Generate MD5 hash of file contents for integrity checking."""
     return hashlib.md5(file_bytes).hexdigest()
+
+
+def generate_source_id(filename: str, sheet_name: Optional[str] = None) -> str:
+    """
+    Generate a stable source ID for a file.
+    
+    Source IDs are used to identify sources across versions for add/replace logic.
+    Format: {filename}_{sheet_name} if sheet_name, else {filename}
+    
+    Args:
+        filename: Original filename
+        sheet_name: Excel sheet name (if applicable)
+    
+    Returns:
+        Stable source ID string
+    """
+    # Normalize filename (lowercase, but keep extension)
+    source_id = filename.lower()
+    
+    # Add sheet name if present (for Excel files)
+    if sheet_name:
+        # Normalize sheet name: lowercase, replace spaces with underscores
+        normalized_sheet = sheet_name.lower().replace(' ', '_')
+        source_id = f"{source_id}_{normalized_sheet}"
+    
+    return source_id
 
 
 def get_s3_dataset_prefix(dataset_id: str) -> str:
@@ -66,7 +92,9 @@ def build_file_mapping(
     column_renames: Dict[str, str],
     cleaning_rules: Dict[str, Any],
     sheet_name: Optional[str] = None,
-    skip_rows: int = 0
+    skip_rows: int = 0,
+    source_id: Optional[str] = None,
+    metadata_columns: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Build the mapping configuration for a single file.
@@ -81,11 +109,22 @@ def build_file_mapping(
         cleaning_rules: Cleaning configuration
         sheet_name: Excel sheet name (if applicable)
         skip_rows: Number of rows to skip
+        source_id: Optional source ID (auto-generated if not provided)
+        metadata_columns: Optional list of columns to exclude from training (auto-detected if None)
     
     Returns:
         Dictionary representing the file mapping
     """
+    # Generate source_id if not provided
+    if source_id is None:
+        source_id = generate_source_id(filename, sheet_name)
+    
+    # Default to empty list if metadata_columns not provided
+    if metadata_columns is None:
+        metadata_columns = []
+    
     return {
+        "source_id": source_id,
         "filename": filename,
         "file_type": file_type,
         "sheet_name": sheet_name,
@@ -93,6 +132,7 @@ def build_file_mapping(
         "zip_column": zip_column,
         "normalization_mode": normalization_mode,
         "feature_columns": feature_columns,
+        "metadata_columns": metadata_columns,
         "column_renames": column_renames,
         "cleaning_rules": cleaning_rules
     }
@@ -111,12 +151,47 @@ class DatasetStorageLocal:
         path.write_bytes(content)
         return str(path)
     
+    def upload_unified_dataset(self, dataset_id: str, version_id: str, csv_bytes: bytes) -> str:
+        """Upload the unified merged dataset CSV."""
+        path = self.base_path / dataset_id / "versions" / version_id / "unified_dataset.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(csv_bytes)
+        return str(path)
+    
+    def download_unified_dataset(self, dataset_id: str, version_id: str) -> bytes:
+        """Download the unified merged dataset CSV."""
+        path = self.base_path / dataset_id / "versions" / version_id / "unified_dataset.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"Unified dataset not found: {path}")
+        return path.read_bytes()
+    
     def download_file(self, dataset_id: str, version_id: str, filename: str) -> bytes:
         """Download a file from local storage."""
         path = self.base_path / dataset_id / "versions" / version_id / "files" / filename
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         return path.read_bytes()
+    
+    def copy_file_from_version(
+        self, 
+        dataset_id: str, 
+        source_version_id: str, 
+        target_version_id: str, 
+        filename: str
+    ) -> str:
+        """Copy a file from one version to another."""
+        source_path = self.base_path / dataset_id / "versions" / source_version_id / "files" / filename
+        target_path = self.base_path / dataset_id / "versions" / target_version_id / "files" / filename
+        
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+        
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Copy file content
+        target_path.write_bytes(source_path.read_bytes())
+        
+        return str(target_path)
     
     def upload_mapping(self, dataset_id: str, version_id: str, filename: str, mapping: Dict) -> str:
         """Upload a mapping JSON file."""
@@ -181,39 +256,11 @@ class DatasetStorageS3:
             raise ValueError("S3 bucket name is required for production storage")
         self.bucket = bucket
         self.region = region
-        self._client = None
-    
-    @property
-    def client(self):
-        """Lazy-load S3 client."""
-        if self._client is None:
-            try:
-                import boto3
-            except ImportError:
-                raise ImportError(
-                    "boto3 is required for S3 storage. Install with: pip install boto3"
-                )
-            try:
-                self._client = boto3.client('s3', region_name=self.region)
-                # Test connection by checking if bucket exists
-                self._client.head_bucket(Bucket=self.bucket)
-            except Exception as e:
-                # Handle boto3 exceptions
-                error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', 'Unknown') if hasattr(e, 'response') else 'Unknown'
-                if error_code == '403' or 'AccessDenied' in str(e):
-                    raise PermissionError(
-                        f"Access denied to S3 bucket '{self.bucket}'. "
-                        "Check IAM permissions or AWS credentials."
-                    ) from e
-                elif error_code == '404' or 'NoSuchBucket' in str(e):
-                    raise ValueError(f"S3 bucket '{self.bucket}' does not exist or is not accessible") from e
-                else:
-                    raise ConnectionError(
-                        f"Failed to connect to S3 bucket '{self.bucket}': {error_code or str(e)}. "
-                        "Check AWS credentials (IAM role, environment variables, or ~/.aws/credentials) "
-                        "and network connectivity."
-                    ) from e
-        return self._client
+        try:
+            import boto3
+        except ImportError:
+            raise ImportError("boto3 is required for S3 storage. Install with: pip install boto3")
+        self.client = boto3.client('s3', region_name=region)
     
     def upload_file(self, dataset_id: str, version_id: str, filename: str, content: bytes) -> str:
         """Upload a file to S3."""
@@ -224,6 +271,33 @@ class DatasetStorageS3:
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
             raise IOError(f"Failed to upload file to S3: {error_code} - {e}") from e
         return f"s3://{self.bucket}/{key}"
+    
+    def upload_unified_dataset(self, dataset_id: str, version_id: str, csv_bytes: bytes) -> str:
+        """Upload the unified merged dataset CSV to S3."""
+        key = f"{get_s3_version_prefix(dataset_id, version_id)}/unified_dataset.csv"
+        try:
+            self.client.put_object(
+                Bucket=self.bucket, Key=key, Body=csv_bytes,
+                ContentType='text/csv'
+            )
+        except self.client.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            raise IOError(f"Failed to upload unified dataset to S3: {error_code} - {e}") from e
+        return f"s3://{self.bucket}/{key}"
+    
+    def download_unified_dataset(self, dataset_id: str, version_id: str) -> bytes:
+        """Download the unified merged dataset CSV from S3."""
+        key = f"{get_s3_version_prefix(dataset_id, version_id)}/unified_dataset.csv"
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+            return response['Body'].read()
+        except self.client.exceptions.NoSuchKey:
+            raise FileNotFoundError(f"Unified dataset not found: s3://{self.bucket}/{key}")
+        except self.client.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'NoSuchKey':
+                raise FileNotFoundError(f"Unified dataset not found: s3://{self.bucket}/{key}")
+            raise IOError(f"Failed to download unified dataset: {error_code} - {e}") from e
     
     def download_file(self, dataset_id: str, version_id: str, filename: str) -> bytes:
         """Download a file from S3."""
@@ -243,6 +317,39 @@ class DatasetStorageS3:
                 raise IOError(f"Failed to download from S3: {error_code} - {e}") from e
         except Exception as e:
             raise IOError(f"Unexpected error downloading from S3: {e}") from e
+    
+    def copy_file_from_version(
+        self, 
+        dataset_id: str, 
+        source_version_id: str, 
+        target_version_id: str, 
+        filename: str
+    ) -> str:
+        """Copy a file from one version to another in S3."""
+        source_key = f"{get_s3_version_prefix(dataset_id, source_version_id)}/files/{filename}"
+        target_key = f"{get_s3_version_prefix(dataset_id, target_version_id)}/files/{filename}"
+        
+        copy_source = {'Bucket': self.bucket, 'Key': source_key}
+        
+        try:
+            self.client.copy_object(
+                CopySource=copy_source,
+                Bucket=self.bucket,
+                Key=target_key
+            )
+            return f"s3://{self.bucket}/{target_key}"
+        except self.client.exceptions.NoSuchKey:
+            raise FileNotFoundError(f"Source file not found in S3: s3://{self.bucket}/{source_key}")
+        except self.client.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'NoSuchKey':
+                raise FileNotFoundError(f"Source file not found in S3: s3://{self.bucket}/{source_key}")
+            elif error_code == '403':
+                raise PermissionError(f"Access denied copying S3 object: s3://{self.bucket}/{source_key}")
+            else:
+                raise IOError(f"Failed to copy file in S3: {error_code} - {e}") from e
+        except Exception as e:
+            raise IOError(f"Unexpected error copying file in S3: {e}") from e
     
     def upload_mapping(self, dataset_id: str, version_id: str, filename: str, mapping: Dict) -> str:
         """Upload a mapping JSON file to S3."""
@@ -346,31 +453,13 @@ def get_storage(use_s3: bool = None):
     
     Returns:
         DatasetStorageLocal or DatasetStorageS3 instance
-    
-    Raises:
-        ValueError: If production mode is enabled but S3 bucket is not configured
-        ImportError: If boto3 is not installed when S3 is required
-        ConnectionError: If S3 connection fails
     """
+    from app.config import get_config
+    config = get_config()
+    
     if use_s3 is None:
-        # Auto-detect from environment
-        from app.config import get_config
-        config = get_config()
-        use_s3 = config.is_production and config.aws_s3_bucket is not None
+        use_s3 = config.is_production and config.aws_s3_bucket
     
     if use_s3:
-        from app.config import get_config
-        config = get_config()
-        
-        # Validate configuration
-        if not config.aws_s3_bucket:
-            raise ValueError(
-                "AWS_S3_BUCKET environment variable is required for production mode. "
-                "Set ENVIRONMENT=development for local storage, or configure AWS_S3_BUCKET."
-            )
-        
-        # Initialize S3 storage (will validate connection)
         return DatasetStorageS3(bucket=config.aws_s3_bucket, region=config.aws_region)
-    else:
-        return DatasetStorageLocal()
-
+    return DatasetStorageLocal()
