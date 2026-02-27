@@ -329,11 +329,53 @@ def _classify_revenue_column(col_name: str) -> str | None:
     return None
 
 
+def _first_existing_path(candidates: list[str]) -> str | None:
+    """Return the first path that exists from a list of candidate relative paths."""
+    for rel_path in candidates:
+        if not rel_path:
+            continue
+        if Path(rel_path).exists():
+            return rel_path
+    return None
+
+
+def _load_latest_uploaded_file_index(dataset_id: str = "pharmacy_data") -> dict[str, str]:
+    """
+    Build a slot->filename index from the latest uploaded dataset config.
+
+    Returns an empty dict when no uploaded dataset config can be found.
+    """
+    try:
+        import json
+
+        latest_meta_path = Path(f"raw_data/datasets/{dataset_id}/LATEST.json")
+        if not latest_meta_path.exists():
+            return {}
+        latest_version = json.loads(latest_meta_path.read_text()).get("latest_version")
+        if not latest_version:
+            return {}
+        cfg_path = Path(
+            f"raw_data/datasets/{dataset_id}/versions/{latest_version}/dataset_config.json"
+        )
+        if not cfg_path.exists():
+            return {}
+        cfg = json.loads(cfg_path.read_text())
+        out: dict[str, str] = {}
+        for src in cfg.get("sources", []):
+            slot = src.get("slot")
+            filename = src.get("filename")
+            if slot and filename:
+                out[slot] = filename
+        return out
+    except Exception:
+        return {}
+
+
 def main():
     st.set_page_config(
         page_title="Pharmacy Desert Explorer", 
         layout="wide", 
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="collapsed"
     )
 
     # Check authentication first (before loading any data)
@@ -349,17 +391,327 @@ def main():
         st.session_state.prev_weights = {}
 
     # =========================================================================
-    # HEADER & MODE SELECTION (before any data loading)
+    # HEADER & TOP NAVIGATION
     # =========================================================================
-    st.title("Pharmacy Desert Explorer")
-    st.markdown("""
-    ### Multi-Model Decision Platform
-    Compare ranked ZIP outputs across:
-    1) **Math model** (weighted, adjustable)
-    2) **GLM model** (pre-trained)
-    3) **Profit Model v2** (Walgreens Part 2)
-    4) **Walgreens Optimizer v2** (Walgreens Part 3)
-    """)
+    st.markdown(
+        """
+        <style>
+        :root {
+            --pd-lime: #99F200;
+            --pd-black: #000000;
+            --pd-gray: #EEEEEE;
+            --pd-white: #FFFFFF;
+        }
+        html, body, [class*="css"] {
+            font-family: Helvetica, Arial, sans-serif !important;
+        }
+        .block-container {
+            max-width: 1260px;
+            padding-top: 1rem;
+            padding-bottom: 1.5rem;
+        }
+        .stApp {
+            background: linear-gradient(180deg, var(--pd-gray) 0%, #F6F6F6 100%);
+        }
+        .top-nav-wrap {
+            background: var(--pd-white);
+            border: 1px solid rgba(0, 0, 0, 0.08);
+            border-radius: 999px;
+            padding: 0.25rem 0.5rem;
+            margin-bottom: 0.9rem;
+        }
+        .hero-wrap {
+            padding: 1.4rem 1.5rem;
+            border-radius: 20px;
+            background: var(--pd-white);
+            border: 1px solid rgba(0, 0, 0, 0.10);
+            margin-bottom: 1rem;
+        }
+        .hero-wrap h1 {
+            margin: 0 0 0.45rem 0;
+            font-size: clamp(2rem, 4.8vw, 4rem);
+            line-height: 1.02;
+            letter-spacing: -0.03em;
+            font-weight: 500;
+            color: var(--pd-black);
+        }
+        .hero-wrap p {
+            margin: 0;
+            color: #1f1f1f;
+            font-size: 1rem;
+            max-width: 1000px;
+        }
+        .mode-wrap {
+            padding: 0.4rem 0.1rem 0.5rem 0.1rem;
+            margin-bottom: 1rem;
+        }
+        .mode-wrap h3 {
+            margin: 0 0 0.45rem 0;
+            font-size: clamp(1.8rem, 2.7vw, 2.25rem);
+            font-weight: 500;
+            color: var(--pd-black);
+        }
+        div.row-widget.stRadio [role="radiogroup"] {
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        div.row-widget.stRadio [role="radiogroup"] label {
+            background: var(--pd-white);
+            border: 1.5px solid rgba(153, 242, 0, 0.60);
+            border-radius: 999px;
+            padding: 0.24rem 0.92rem;
+        }
+        div.row-widget.stRadio [role="radiogroup"] label:has(input:checked) {
+            background: var(--pd-lime) !important;
+            border-color: var(--pd-lime) !important;
+        }
+        div.row-widget.stRadio [role="radiogroup"] label p {
+            color: var(--pd-black) !important;
+            font-weight: 500;
+        }
+        div.row-widget.stRadio [role="radiogroup"] label > div:first-child {
+            display: none;
+        }
+        .pd-map-title-tab {
+            display: inline-block;
+            background: var(--pd-black);
+            color: var(--pd-lime);
+            border-radius: 14px 14px 0 0;
+            padding: 0.7rem 1.4rem;
+            font-size: 2rem;
+            font-weight: 500;
+            line-height: 1;
+            margin-bottom: -1px;
+        }
+        .pd-map-shell {
+            background: #E8E8E8;
+            border: 1px solid #D8D8D8;
+            border-radius: 16px;
+            padding: 0.8rem;
+            margin-bottom: 1rem;
+        }
+        .pd-controls-shell {
+            background: #E8E8E8;
+            border: 1px solid #D8D8D8;
+            border-radius: 16px;
+            padding: 0.75rem 0.8rem;
+            margin-top: 0.5rem;
+        }
+        .pd-panel-title {
+            background: var(--pd-black);
+            color: var(--pd-white);
+            border-radius: 10px 10px 0 0;
+            padding: 0.5rem 0.7rem;
+            margin: 0 0 0.55rem 0;
+            font-weight: 500;
+            font-size: 1.05rem;
+        }
+        .pd-kpi-section {
+            background: #E8E8E8;
+            border: 1px solid #D8D8D8;
+            border-radius: 16px;
+            padding: 1.1rem 1.1rem 1rem 1.1rem;
+            margin: 1rem 0;
+        }
+        .pd-kpi-section h3 {
+            margin: 0;
+            font-size: clamp(1.85rem, 2.6vw, 2.2rem);
+            font-weight: 500;
+            color: var(--pd-black);
+        }
+        .pd-kpi-section p {
+            margin: 0.15rem 0 0.95rem 0;
+            color: #2C2C2C;
+            font-size: 0.9rem;
+        }
+        .pd-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.75rem;
+        }
+        .pd-kpi-card {
+            background: var(--pd-black);
+            border-radius: 12px;
+            padding: 0.7rem 0.85rem;
+            min-height: 84px;
+        }
+        .pd-kpi-label {
+            margin: 0;
+            color: #C8C8C8;
+            font-size: 0.74rem;
+            line-height: 1.2;
+        }
+        .pd-kpi-value {
+            margin: 0.4rem 0 0 0;
+            color: var(--pd-lime);
+            font-size: 2rem;
+            font-weight: 600;
+            line-height: 1;
+        }
+        .pd-weight-shell {
+            background: #E8E8E8;
+            border: 1px solid #D8D8D8;
+            border-radius: 16px;
+            padding: 1rem 1.1rem 0.2rem 1.1rem;
+            margin: 1rem 0;
+        }
+        .pd-footer {
+            background: var(--pd-black);
+            color: var(--pd-lime);
+            border-radius: 14px;
+            text-align: center;
+            padding: 0.95rem 1rem;
+            margin-top: 1.2rem;
+            font-size: 0.82rem;
+            line-height: 1.35;
+        }
+        div.stDownloadButton > button {
+            background: var(--pd-black);
+            color: var(--pd-white);
+            border: 1px solid var(--pd-black);
+            border-radius: 999px;
+            min-height: 34px;
+            padding: 0.1rem 0.9rem;
+        }
+        div.stDownloadButton > button:hover {
+            color: var(--pd-lime);
+            border-color: var(--pd-lime);
+        }
+        div[data-baseweb="slider"] [role="slider"] {
+            background: var(--pd-black);
+            border: 2px solid var(--pd-lime);
+            box-shadow: none;
+        }
+        @media (max-width: 1200px) {
+            .pd-kpi-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .pd-map-title-tab {
+                font-size: 1.35rem;
+            }
+        }
+        @media (max-width: 700px) {
+            .pd-kpi-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="top-nav-wrap">', unsafe_allow_html=True)
+    nav_choice = st.radio(
+        "Navigation",
+        ["Overview", "Upload", "Dataset"],
+        index=0,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="top_nav_choice",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    if nav_choice == "Upload":
+        st.switch_page("pages/Upload_Data.py")
+        st.stop()
+
+    st.markdown(
+        """
+        <div class="hero-wrap">
+            <h1>Welcome to Pharmacy Desert Explorer</h1>
+            <p>
+                Identifying pharmacy deserts that meet McKesson's criteria for investment, helping determine where
+                new pharmacy locations could improve access to care while remaining operationally viable.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if nav_choice == "Dataset":
+        st.subheader("Datasets Used By Model")
+        available_datasets = get_available_datasets()
+        default_dataset_id = "pharmacy_data"
+        pharmacy_dataset = next(
+            (d for d in available_datasets if d.get("dataset_id") == default_dataset_id),
+            None,
+        )
+        latest_uploaded_files = _load_latest_uploaded_file_index(default_dataset_id)
+
+        glm_result_path = _first_existing_path(["results/national_ifae_rank.csv"])
+        profit_result_path = _first_existing_path(
+            [
+                "results_v2/profit_scores.csv",
+                "deployment/walgreens_portfolio/results_v2/profit_scores.csv",
+            ]
+        )
+        optimizer_result_path = _first_existing_path(
+            [
+                "results_walgreens/store_viability_scores.csv",
+                "deployment/walgreens_portfolio/results_walgreens/store_viability_scores.csv",
+            ]
+        )
+        math_version = pharmacy_dataset.get("version") if pharmacy_dataset else ""
+        unified_math_path = (
+            f"raw_data/datasets/{default_dataset_id}/versions/{math_version}/unified_dataset.csv"
+            if math_version
+            else ""
+        )
+        math_exists = bool(unified_math_path and Path(unified_math_path).exists())
+
+        rows = [
+            {
+                "Model Type": "GLM Only",
+                "Primary Dataset": glm_result_path or "results/national_ifae_rank.csv",
+                "Loaded": "Yes" if glm_result_path else "No",
+                "Notes": "Precomputed GLM predictions by ZIP",
+            },
+            {
+                "Model Type": "Profit Model v2",
+                "Primary Dataset": profit_result_path or "results_v2/profit_scores.csv",
+                "Loaded": "Yes" if profit_result_path else "No",
+                "Notes": "Walgreens Part 2 ZCTA profit output",
+            },
+            {
+                "Model Type": "Walgreens Optimizer v2",
+                "Primary Dataset": optimizer_result_path or "results_walgreens/store_viability_scores.csv",
+                "Loaded": "Yes" if optimizer_result_path else "No",
+                "Notes": "Walgreens Part 3 viability/actions output",
+            },
+            {
+                "Model Type": "Math Only",
+                "Primary Dataset": unified_math_path or "Latest uploaded unified dataset",
+                "Loaded": "Yes" if math_exists else "No",
+                "Notes": f"Dataset version: {math_version or 'none'}",
+            },
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        if latest_uploaded_files:
+            st.caption("Latest uploaded source files feeding Math mode:")
+            src_rows = [
+                {"Slot": slot, "Filename": filename}
+                for slot, filename in sorted(latest_uploaded_files.items())
+            ]
+            st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No uploaded source file manifest found yet. Use Upload to register files.")
+        st.stop()
+
+    st.markdown('<div class="mode-wrap">', unsafe_allow_html=True)
+    st.markdown("<h3>Choose your scoring mode</h3>", unsafe_allow_html=True)
+    scoring_mode = st.radio(
+        "Choose ranking method:",
+        ["GLM Only", "Profit Model v2", "Walgreens Optimizer v2", "Math Only"],
+        horizontal=True,
+        label_visibility="collapsed",
+        help=(
+            "GLM Only: Pretrained model results | "
+            "Profit Model v2: Walgreens Part 2 ZCTA profit scores | "
+            "Walgreens Optimizer v2: Walgreens Part 3 viability/actions | "
+            "Math Only: Full dataset + adjustable weighted equation"
+        ),
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
     st.divider()
 
     # =========================================================================
@@ -458,21 +810,6 @@ def main():
     
     st.sidebar.divider()
 
-    # Scoring mode selection - THIS MUST COME BEFORE DATA LOADING
-    st.sidebar.header("Scoring Mode")
-    scoring_mode = st.sidebar.radio(
-        "Choose ranking method:", 
-        ["GLM Only", "Profit Model v2", "Walgreens Optimizer v2", "Math Only"], 
-        index=0,
-        help=(
-            "GLM Only: Pretrained model results | "
-            "Profit Model v2: Walgreens Part 2 ZCTA profit scores | "
-            "Walgreens Optimizer v2: Walgreens Part 3 viability/actions | "
-            "Math Only: Full dataset + adjustable weighted equation"
-        )
-    )
-    st.sidebar.divider()
-
     # Refresh Data button and logout
     st.sidebar.header("🔄 Data Management")
     if st.sidebar.button("🔄 Refresh Data", help="Clear cache and reload all data"):
@@ -569,12 +906,11 @@ def main():
     logout_button()
     
     if scoring_mode == "GLM Only":
-        st.sidebar.caption("💡 GLM mode: Fast startup, uses existing trained model outputs.")
+        st.caption("💡 GLM mode: Fast startup, uses existing trained model outputs.")
     elif scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"}:
-        st.sidebar.caption("💡 Walgreens modes: Load pipeline outputs from local CSV files.")
+        st.caption("💡 Walgreens modes: Load pipeline outputs from local CSV files.")
     else:
-        st.sidebar.caption("⚠️ Math mode: Loads full uploaded dataset and applies sliders.")
-    st.sidebar.divider()
+        st.caption("⚠️ Math mode: Loads full uploaded dataset and applies sliders.")
 
     def _attach_latlon_if_missing(ranked_df: pd.DataFrame) -> pd.DataFrame:
         """Attach lat/lon by ZIP if the selected model output doesn't include it."""
@@ -603,6 +939,8 @@ def main():
         if latlon_df.empty:
             return ranked_df
         return ranked_df.merge(latlon_df[["zip", "lat", "lon"]], on="zip", how="left")
+
+    math_map_rendered = False
 
     # =========================================================================
     # CONDITIONAL DATA LOADING
@@ -801,179 +1139,189 @@ def main():
             st.stop()
 
         # =====================================================================
-        # SCORING WEIGHT SLIDERS
+        # SCORING WEIGHT SLIDERS (left) + LIVE MAP (right)
         # =====================================================================
-        st.sidebar.header("Model Weights")
-        st.sidebar.markdown("*Adjust scoring priorities:*")
+        map_col, controls_col = st.columns([1.75, 1.0], gap="large")
+        with controls_col:
+            st.markdown('<div class="pd-controls-shell">', unsafe_allow_html=True)
+            st.markdown('<div class="pd-panel-title">Mathematical Model Weights</div>', unsafe_allow_html=True)
+            st.caption("Metrics")
+            with st.container(border=False):
+                weights_col, filters_col = st.columns([1.1, 0.9], gap="large")
 
-        w_scarcity = st.sidebar.slider(
-            "Pharmacy Scarcity", 0.0, 1.0, 0.30, 0.05,
-            key="w_scarcity",
-            help="Weight for 1/(1+n_pharmacies). Fewer pharmacies → higher need.",
-        )
-        w_health = st.sidebar.slider(
-            "Health Burden", 0.0, 1.0, 0.25, 0.05,
-            key="w_health",
-            help="Weight for poor-health prevalence (PLACES GHLTH).",
-        )
-        w_income = st.sidebar.slider(
-            "Income (inverted)", 0.0, 1.0, 0.20, 0.05,
-            key="w_income",
-            help="Lower median income → higher need score.",
-        )
-        w_pop = st.sidebar.slider(
-            "Population Density", 0.0, 1.0, 0.10, 0.05,
-            key="w_pop",
-            help="Denser areas with gaps = more affected people.",
-        )
+                with weights_col:
+                    st.markdown("**Model Weights**")
+                    w_scarcity = st.slider(
+                        "Pharmacy Scarcity", 0.0, 1.0, 0.30, 0.05,
+                        key="w_scarcity",
+                        help="Weight for 1/(1+n_pharmacies). Fewer pharmacies -> higher need.",
+                    )
+                    w_health = st.slider(
+                        "Health Burden", 0.0, 1.0, 0.25, 0.05,
+                        key="w_health",
+                        help="Weight for poor-health prevalence (PLACES GHLTH).",
+                    )
+                    w_income = st.slider(
+                        "Income (inverted)", 0.0, 1.0, 0.20, 0.05,
+                        key="w_income",
+                        help="Lower median income -> higher need score.",
+                    )
+                    w_pop = st.slider(
+                        "Population Density", 0.0, 1.0, 0.10, 0.05,
+                        key="w_pop",
+                        help="Denser areas with gaps = more affected people.",
+                    )
 
-        w_edu = 0.0
-        if "edu_hs_or_lower_pct" in df.columns:
-            w_edu = st.sidebar.slider(
-                "Low Education %", 0.0, 1.0, 0.05, 0.05,
-                key="w_edu",
-                help="% with HS diploma or lower (health-literacy proxy).",
-            )
+                    w_edu = 0.0
+                    if "edu_hs_or_lower_pct" in df.columns:
+                        w_edu = st.slider(
+                            "Low Education %", 0.0, 1.0, 0.05, 0.05,
+                            key="w_edu",
+                            help="% with HS diploma or lower (health-literacy proxy).",
+                        )
 
-        w_drive_time = 0.0
-        if "zip_drive_time" in df.columns and df["zip_drive_time"].notna().any():
-            w_drive_time = st.sidebar.slider(
-                "Drive Time", 0.0, 1.0, 0.10, 0.05,
-                key="w_drive_time",
-                help="Average drive time to nearest pharmacy (county-downscaled).",
-            )
+                    w_drive_time = 0.0
+                    if "zip_drive_time" in df.columns and df["zip_drive_time"].notna().any():
+                        w_drive_time = st.slider(
+                            "Drive Time", 0.0, 1.0, 0.10, 0.05,
+                            key="w_drive_time",
+                            help="Average drive time to nearest pharmacy (county-downscaled).",
+                        )
 
-        w_heat = 0.0
-        if "heat_hhb" in df.columns:
-            w_heat = st.sidebar.slider(
-                "Heat Vulnerability", 0.0, 1.0, 0.05, 0.05,
-                key="w_heat",
-                help="Heat-health burden index (HHI).",
-            )
+                    w_heat = 0.0
+                    if "heat_hhb" in df.columns:
+                        w_heat = st.slider(
+                            "Heat Vulnerability", 0.0, 1.0, 0.05, 0.05,
+                            key="w_heat",
+                            help="Heat-health burden index (HHI).",
+                        )
 
-        extra_feature_defaults = (
-            scoring_config.custom_feature_weights
-            if scoring_config and hasattr(scoring_config, "custom_feature_weights")
-            else {}
-        ) or {}
-        core_scoring_columns = {
-            "zip", "n_pharmacies", "population", "median_income", "health_burden",
-            "pop_density", "edu_hs_or_lower_pct", "zip_drive_time", "heat_hhb",
-            "lat", "lon", "score", "final_score", "ai_score", "desert_flag",
-            "pharm_per_10k", "zip_desert_flag", "zip_desert_flag_user",
-        }
+                with filters_col:
+                    extra_feature_defaults = (
+                        scoring_config.custom_feature_weights
+                        if scoring_config and hasattr(scoring_config, "custom_feature_weights")
+                        else {}
+                    ) or {}
+                    core_scoring_columns = {
+                        "zip", "n_pharmacies", "population", "median_income", "health_burden",
+                        "pop_density", "edu_hs_or_lower_pct", "zip_drive_time", "heat_hhb",
+                        "lat", "lon", "score", "final_score", "ai_score", "desert_flag",
+                        "pharm_per_10k", "zip_desert_flag", "zip_desert_flag_user",
+                    }
 
-        extra_feature_candidates: list[str] = []
-        for col in sorted(extra_feature_defaults.keys()):
-            if col in df.columns and col not in core_scoring_columns and _is_numeric_feature_candidate(df[col]):
-                extra_feature_candidates.append(col)
+                    extra_feature_candidates: list[str] = []
+                    for col in sorted(extra_feature_defaults.keys()):
+                        if col in df.columns and col not in core_scoring_columns and _is_numeric_feature_candidate(df[col]):
+                            extra_feature_candidates.append(col)
 
-        for col in sorted(c for c in df.columns if "__" in c):
-            if (
-                col not in core_scoring_columns
-                and col not in extra_feature_candidates
-                and _is_numeric_feature_candidate(df[col])
-            ):
-                extra_feature_candidates.append(col)
+                    for col in sorted(c for c in df.columns if "__" in c):
+                        if (
+                            col not in core_scoring_columns
+                            and col not in extra_feature_candidates
+                            and _is_numeric_feature_candidate(df[col])
+                        ):
+                            extra_feature_candidates.append(col)
 
-        extra_feature_weights: dict[str, float] = {}
-        if extra_feature_candidates:
-            st.sidebar.markdown("**Additional Uploaded Features**")
-            st.sidebar.caption(
-                "New numeric custom fields from uploaded datasets can be weighted here."
-            )
-            dataset_version_for_keys = (
-                pharmacy_dataset.get("version", "none") if pharmacy_dataset else "none"
-            )
-            for col in extra_feature_candidates:
-                default_weight = float(extra_feature_defaults.get(col, 0.05))
-                default_weight = min(1.0, max(0.0, default_weight))
-                slider_key = (
-                    "w_extra_"
-                    + hashlib.md5(f"{dataset_version_for_keys}:{col}".encode("utf-8")).hexdigest()[:12]
+                    extra_feature_weights: dict[str, float] = {}
+                    if extra_feature_candidates:
+                        st.markdown("**Additional Uploaded Features**")
+                        st.caption(
+                            "New numeric custom fields from uploaded datasets can be weighted here."
+                        )
+                        dataset_version_for_keys = (
+                            pharmacy_dataset.get("version", "none") if pharmacy_dataset else "none"
+                        )
+                        for col in extra_feature_candidates:
+                            default_weight = float(extra_feature_defaults.get(col, 0.05))
+                            default_weight = min(1.0, max(0.0, default_weight))
+                            slider_key = (
+                                "w_extra_"
+                                + hashlib.md5(f"{dataset_version_for_keys}:{col}".encode("utf-8")).hexdigest()[:12]
+                            )
+                            extra_feature_weights[col] = st.slider(
+                                _format_feature_label(col),
+                                0.0,
+                                1.0,
+                                default_weight,
+                                0.05,
+                                key=slider_key,
+                                help=f"Additional uploaded feature: `{col}`",
+                            )
+                    else:
+                        extra_feature_weights = {}
+
+            weights = {
+                "scarcity": w_scarcity, "health": w_health, "income": w_income,
+                "pop": w_pop, "edu": w_edu, "drive_time": w_drive_time, "heat": w_heat,
+            }
+            for col, weight in extra_feature_weights.items():
+                weights[f"feature::{col}"] = weight
+
+            if "zip_desert_share" in df.columns:
+                st.markdown('<div class="pd-panel-title">GoodRx Desert Gate</div>', unsafe_allow_html=True)
+                gate_goodrx = st.checkbox(
+                    "Hard gate to GoodRx-defined deserts",
+                    value=False,
+                    help="When ON, only ZIPs that are GoodRx drive-time deserts are kept."
                 )
-                extra_feature_weights[col] = st.sidebar.slider(
-                    _format_feature_label(col),
-                    0.0,
-                    1.0,
-                    default_weight,
-                    0.05,
-                    key=slider_key,
-                    help=f"Additional uploaded feature: `{col}`",
-                )
+                min_cov = st.slider("Minimum crosswalk coverage (HUD)", 0.0, 1.0, 0.60, 0.05)
+                thr_goodrx = st.slider("Desert severity threshold", 0.0, 1.0, 0.50, 0.05)
+                df["zip_desert_flag_user"] = (df["zip_desert_share"] >= thr_goodrx).astype("Int64")
 
-        weights = {
-            "scarcity": w_scarcity, "health": w_health, "income": w_income,
-            "pop": w_pop, "edu": w_edu, "drive_time": w_drive_time, "heat": w_heat,
-        }
-        for col, weight in extra_feature_weights.items():
-            weights[f"feature::{col}"] = weight
-        st.sidebar.divider()
+                if gate_goodrx:
+                    flag_col = "zip_desert_flag_user" if "zip_desert_flag_user" in df.columns else "zip_desert_flag"
+                    if flag_col not in df.columns:
+                        st.warning("GoodRx gate requested, but downscaled fields not found.")
+                    else:
+                        mask = (df[flag_col] == 1) & (df.get("zip_alloc_coverage", 0).fillna(0) >= min_cov)
+                        kept = df.loc[mask].copy()
+                        dropped = len(df) - len(kept)
+                        st.info(f"GoodRx hard gate active -> kept {len(kept):,} ZIPs, filtered out {dropped:,}.")
+                        if kept.empty:
+                            st.warning("No ZIPs pass the GoodRx gate. Lower coverage/threshold.")
+                            st.stop()
+                        df = kept
+                    st.caption(f"GoodRx hard gate ON | min HUD coverage >= {min_cov:.0%} | threshold >= {thr_goodrx:.0%}")
+            else:
+                gate_goodrx = False
 
-        if "zip_desert_share" in df.columns:
-            st.sidebar.header("GoodRx Desert Gate")
-            gate_goodrx = st.sidebar.checkbox(
-                "Hard gate to GoodRx-defined deserts",
-                value=False,
-                help="When ON, only ZIPs that are GoodRx drive-time deserts are kept."
-            )
-            min_cov = st.sidebar.slider("Minimum crosswalk coverage (HUD)", 0.0, 1.0, 0.60, 0.05)
-            thr_goodrx = st.sidebar.slider("Desert severity threshold", 0.0, 1.0, 0.50, 0.05)
-            df["zip_desert_flag_user"] = (df["zip_desert_share"] >= thr_goodrx).astype("Int64")
+            if "pop_density" in df.columns or "population" in df.columns:
+                st.markdown('<div class="pd-panel-title">Target Area Filters</div>', unsafe_allow_html=True)
+                st.caption("Focus on semi-urban communities.")
 
-            if gate_goodrx:
-                flag_col = "zip_desert_flag_user" if "zip_desert_flag_user" in df.columns else "zip_desert_flag"
-                if flag_col not in df.columns:
-                    st.warning("GoodRx gate requested, but downscaled fields not found.")
-                else:
-                    mask = (df[flag_col] == 1) & (df.get("zip_alloc_coverage", 0).fillna(0) >= min_cov)
-                    kept = df.loc[mask].copy()
-                    dropped = len(df) - len(kept)
-                    st.info(f"GoodRx hard gate active → kept {len(kept):,} ZIPs, filtered out {dropped:,}.")
-                    if kept.empty:
-                        st.warning("No ZIPs pass the GoodRx gate. Lower coverage/threshold.")
-                        st.stop()
-                    df = kept
-                st.caption(f"🔒 GoodRx hard gate ON · min HUD coverage ≥ {min_cov:.0%} · threshold ≥ {thr_goodrx:.0%}")
-        else:
-            gate_goodrx = False
+                min_population = st.slider(
+                    "Minimum population", 0, 50000, 5000, 1000,
+                    help="Exclude very small ZIPs"
+                ) if "population" in df.columns else 0
 
-        if "pop_density" in df.columns or "population" in df.columns:
-            st.sidebar.header("🏙️ Target Area Filters")
-            st.sidebar.markdown("*Focus on semi-urban communities:*")
+                min_density = st.slider(
+                    "Minimum density (people/km^2)", 0, 1000, 100, 50,
+                    help="100-400 = semi-urban sweet spot"
+                ) if "pop_density" in df.columns else 0
 
-            min_population = st.sidebar.slider(
-                "Minimum population", 0, 50000, 5000, 1000,
-                help="Exclude very small ZIPs"
-            ) if "population" in df.columns else 0
+                max_density = st.slider(
+                    "Maximum density (people/km^2)", 0, 10000, 5000, 500,
+                    help="Exclude extremely dense urban cores if desired. 0 = no max"
+                ) if "pop_density" in df.columns else 0
 
-            min_density = st.sidebar.slider(
-                "Minimum density (people/km²)", 0, 1000, 100, 50,
-                help="100-400 = semi-urban sweet spot"
-            ) if "pop_density" in df.columns else 0
+                filters_applied = []
+                df_before_filters = len(df)
 
-            max_density = st.sidebar.slider(
-                "Maximum density (people/km²)", 0, 10000, 5000, 500,
-                help="Exclude extremely dense urban cores if desired. 0 = no max"
-            ) if "pop_density" in df.columns else 0
+                if min_population > 0 and "population" in df.columns:
+                    df = df[df["population"].fillna(0) >= min_population]
+                    filters_applied.append(f"pop >= {min_population:,}")
+                if min_density > 0 and "pop_density" in df.columns:
+                    df = df[df["pop_density"].fillna(0) >= min_density]
+                    filters_applied.append(f"density >= {min_density}")
+                if max_density > 0 and "pop_density" in df.columns:
+                    df = df[df["pop_density"].fillna(999999) <= max_density]
+                    filters_applied.append(f"density <= {max_density}")
 
-            filters_applied = []
-            df_before_filters = len(df)
-
-            if min_population > 0 and "population" in df.columns:
-                df = df[df["population"].fillna(0) >= min_population]
-                filters_applied.append(f"pop ≥ {min_population:,}")
-            if min_density > 0 and "pop_density" in df.columns:
-                df = df[df["pop_density"].fillna(0) >= min_density]
-                filters_applied.append(f"density ≥ {min_density}")
-            if max_density > 0 and "pop_density" in df.columns:
-                df = df[df["pop_density"].fillna(999999) <= max_density]
-                filters_applied.append(f"density ≤ {max_density}")
-
-            if filters_applied:
-                filtered_count = df_before_filters - len(df)
-                st.info(f"🏙️ Target area filters → kept {len(df):,} ZIPs, filtered {filtered_count:,}")
-                st.caption(f"Active: {' | '.join(filters_applied)}")
+                if filters_applied:
+                    filtered_count = df_before_filters - len(df)
+                    st.info(f"Target area filters -> kept {len(df):,} ZIPs, filtered {filtered_count:,}")
+                    st.caption(f"Active: {' | '.join(filters_applied)}")
+            st.markdown("</div>", unsafe_allow_html=True)
 
         if df.empty:
             st.warning("No ZIPs pass all filters. Relax filter criteria.")
@@ -989,7 +1337,33 @@ def main():
         ranked["final_score"] = ranked["score"]
         ranked["ai_score"] = np.nan
         sort_col = "final_score"
-        st.sidebar.success("Using Mathematical Model")
+        st.success("Using Mathematical Model")
+
+        with map_col:
+            map_title = "Top 10 ZIPs on Interactive Map"
+            map_preview = ranked.sort_values(sort_col, ascending=False, na_position="last").head(10).copy()
+            map_dl_col, map_btn_col = st.columns([1.6, 0.8], vertical_alignment="bottom")
+            with map_dl_col:
+                st.markdown(f'<div class="pd-map-title-tab">{map_title}</div>', unsafe_allow_html=True)
+            with map_btn_col:
+                st.download_button(
+                    "Download reports",
+                    data=map_preview.to_csv(index=False),
+                    file_name="math_top10_map_report.csv",
+                    mime="text/csv",
+                    key="math_map_report_download",
+                )
+            st.markdown('<div class="pd-map-shell">', unsafe_allow_html=True)
+            map_preview = ranked.sort_values(sort_col, ascending=False, na_position="last").head(10).copy()
+            math_map_key = f"map_math_inline_{len(map_preview)}"
+            render_top10_map(
+                map_preview,
+                pharmacist_df=pharmacist_data,
+                pharmacy_df=pharmacy_detail_data,
+                map_key=math_map_key,
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+            math_map_rendered = True
 
     # =========================================================================
     # COMMON POST-PROCESSING (all modes)
@@ -1020,19 +1394,12 @@ def main():
     is_worst_view = ranking_view.startswith("Worst")
     ranking_view_short = "Worst" if is_worst_view else "Best"
 
-    if scoring_mode == "Walgreens Optimizer v2":
-        st.write(f"### {ranking_view_short} Walgreens Viability ZIPs")
-    elif scoring_mode == "Profit Model v2":
-        st.write(f"### {ranking_view_short} Profit Opportunity ZIPs")
-    else:
-        st.write("### Top Pharmacy Desert Candidates")
     mode_labels = {
-        "Math Only": "🔢 Mathematical Weighted Equation",
-        "GLM Only": "🧠 GLM Model",
-        "Profit Model v2": "💼 Walgreens Profit Model v2 (Part 2)",
-        "Walgreens Optimizer v2": "🏪 Walgreens Optimizer v2 (Part 3)",
+        "Math Only": "Mathematical Weighted Equation",
+        "GLM Only": "GLM Model",
+        "Profit Model v2": "Walgreens Profit Model v2 (Part 2)",
+        "Walgreens Optimizer v2": "Walgreens Optimizer v2 (Part 3)",
     }
-    st.caption(f"**Active Mode:** {mode_labels[scoring_mode]}")
 
     if scoring_mode in {"Profit Model v2", "Walgreens Optimizer v2"}:
         display_ranked = (
@@ -1044,31 +1411,60 @@ def main():
         st.caption(f"Showing {direction_text} `{sort_col}` ZIPs.")
     else:
         display_ranked = ranked.copy()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total ZIPs Analyzed", f"{len(ranked):,}")
-    with col2:
-        if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
-            st.metric("Closure Candidates", f"{(ranked['action'] == 'CLOSURE CANDIDATE').sum():,}")
-        elif scoring_mode == "Profit Model v2" and "is_pharmacy_desert" in ranked.columns:
-            desert_count = pd.to_numeric(ranked["is_pharmacy_desert"], errors="coerce").fillna(0).astype(int).sum()
-            st.metric("Pharmacy Deserts", f"{desert_count:,}")
-        else:
-            st.metric("Zero-Pharmacy Deserts", f"{(ranked['desert_flag'] == 1).sum():,}")
-    with col3:
-        st.metric("Avg Final Score", f"{ranked[sort_col].mean():.3f}")
-    with col4:
-        if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
-            st.metric("Protect & Invest", f"{(ranked['action'] == 'PROTECT & INVEST').sum():,}")
-        elif scoring_mode == "Profit Model v2" and "tier" in ranked.columns:
-            premium_count = (ranked["tier"].astype(str) == "Premium").sum()
-            st.metric("Premium Tier ZIPs", f"{premium_count:,}")
-        elif 'ai_score' in ranked.columns and ranked['ai_score'].notna().any():
-            ai_coverage = ranked['ai_score'].notna().sum()
-            st.metric("GLM Coverage", f"{100 * ai_coverage / len(ranked):.1f}%")
-        else:
-            st.metric("Model Coverage", "N/A")
+
+    if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
+        card2_label = "Closure Candidates"
+        card2_value = f"{(ranked['action'] == 'CLOSURE CANDIDATE').sum():,}"
+    elif scoring_mode == "Profit Model v2" and "is_pharmacy_desert" in ranked.columns:
+        desert_count = pd.to_numeric(ranked["is_pharmacy_desert"], errors="coerce").fillna(0).astype(int).sum()
+        card2_label = "Pharmacy Deserts"
+        card2_value = f"{desert_count:,}"
+    else:
+        card2_label = "Zero-Pharmacy Deserts"
+        card2_value = f"{(ranked['desert_flag'] == 1).sum():,}"
+
+    if scoring_mode == "Walgreens Optimizer v2" and "action" in ranked.columns:
+        card4_label = "Protect & Invest"
+        card4_value = f"{(ranked['action'] == 'PROTECT & INVEST').sum():,}"
+    elif scoring_mode == "Profit Model v2" and "tier" in ranked.columns:
+        premium_count = (ranked["tier"].astype(str) == "Premium").sum()
+        card4_label = "Premium Tier ZIPs"
+        card4_value = f"{premium_count:,}"
+    elif "ai_score" in ranked.columns and ranked["ai_score"].notna().any():
+        ai_coverage = ranked["ai_score"].notna().sum()
+        card4_label = "GLM Coverage"
+        card4_value = f"{100 * ai_coverage / len(ranked):.1f}%"
+    else:
+        card4_label = "Model Coverage"
+        card4_value = "N/A"
+
+    kpi_cards = [
+        ("Total ZIP Analyzed", f"{len(ranked):,}"),
+        (card2_label, card2_value),
+        ("Avg Final Score", f"{ranked[sort_col].mean():.3f}"),
+        (card4_label, card4_value),
+    ]
+    cards_html = "".join(
+        [
+            (
+                '<div class="pd-kpi-card">'
+                f'<p class="pd-kpi-label">{label}</p>'
+                f'<p class="pd-kpi-value">{value}</p>'
+                "</div>"
+            )
+            for label, value in kpi_cards
+        ]
+    )
+    st.markdown(
+        (
+            '<div class="pd-kpi-section">'
+            '<h3>Top Pharmacy Desert Candidates</h3>'
+            f'<p>Active Mode: {mode_labels[scoring_mode]}</p>'
+            f'<div class="pd-kpi-grid">{cards_html}</div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     # Weight distribution chart (Math mode only)
     if scoring_mode == "Math Only" and weights:
@@ -1076,8 +1472,9 @@ def main():
         total_weight = sum(active_weights.values())
 
         if active_weights and total_weight > 0:
-            st.divider()
-            st.write("#### Weight Distribution")
+            st.markdown('<div class="pd-weight-shell">', unsafe_allow_html=True)
+            st.write("### Weight Distribution")
+            st.caption("Current Weight Distribution (Normalized)")
             import plotly.graph_objects as go
 
             display_names = {
@@ -1098,14 +1495,20 @@ def main():
                 x=names, y=values,
                 text=[f'{v:.1%}' for v in values],
                 textposition='auto',
+                marker_color="#99F200",
             )])
             fig.update_layout(
-                title="Current Weight Distribution (Normalized)",
                 yaxis_title="Weight",
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#000000"),
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.15)"),
             )
             st.plotly_chart(fig, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
     # Build show columns dynamically based on what exists
     show_cols = ['zip']
@@ -1260,25 +1663,47 @@ def main():
 
     st.dataframe(display_ranked[table_cols].head(50), use_container_width=True, height=400)
 
-    # Interactive Map
-    if scoring_mode == "Walgreens Optimizer v2":
-        st.write(f"### {ranking_view_short} 10 Walgreens ZIPs on Interactive Map")
-    elif scoring_mode == "Profit Model v2":
-        st.write(f"### {ranking_view_short} 10 Profit ZIPs on Interactive Map")
-    else:
-        st.write("### Top 10 ZIPs on Interactive Map")
-    safe_mode_key = scoring_mode.lower().replace(" ", "_")
-    safe_view_key = ranking_view_short.lower()
-    map_key = f"map_{safe_mode_key}_{safe_view_key}_{len(display_ranked)}"
-    if map_key not in st.session_state:
-        st.session_state[map_key] = True
+    if not (scoring_mode == "Math Only" and math_map_rendered):
+        # Interactive Map
+        if scoring_mode == "Math Only":
+            map_title = "Top 10 ZIPs on Interactive Map"
+        elif scoring_mode == "Walgreens Optimizer v2":
+            map_title = f"{ranking_view_short} 10 Walgreens ZIPs on Interactive Map"
+        elif scoring_mode == "Profit Model v2":
+            map_title = f"{ranking_view_short} 10 Profit ZIPs on Interactive Map"
+        else:
+            map_title = "Top 10 ZIPs on Interactive Map"
+        map_export_prefix = {
+            "Math Only": "math_model",
+            "GLM Only": "glm_model",
+            "Profit Model v2": "profit_model_v2",
+            "Walgreens Optimizer v2": "walgreens_optimizer_v2",
+        }.get(scoring_mode, "results")
+        safe_mode_key = scoring_mode.lower().replace(" ", "_")
+        safe_view_key = ranking_view_short.lower()
+        map_header_col, map_download_col = st.columns([1.6, 0.8], vertical_alignment="bottom")
+        with map_header_col:
+            st.markdown(f'<div class="pd-map-title-tab">{map_title}</div>', unsafe_allow_html=True)
+        with map_download_col:
+            st.download_button(
+                "Download reports",
+                data=display_ranked.head(100).to_csv(index=False),
+                file_name=f"{map_export_prefix}_map_report.csv",
+                mime="text/csv",
+                key=f"map_download_{safe_mode_key}_{safe_view_key}",
+            )
+        st.markdown('<div class="pd-map-shell">', unsafe_allow_html=True)
+        map_key = f"map_{safe_mode_key}_{safe_view_key}_{len(display_ranked)}"
+        if map_key not in st.session_state:
+            st.session_state[map_key] = True
 
-    render_top10_map(
-        display_ranked.head(10).copy(),
-        pharmacist_df=pharmacist_data,
-        pharmacy_df=pharmacy_detail_data,
-        map_key=map_key,
-    )
+        render_top10_map(
+            display_ranked.head(10).copy(),
+            pharmacist_df=pharmacist_data,
+            pharmacy_df=pharmacy_detail_data,
+            map_key=map_key,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # Export Results
     st.write("### Export Results")
@@ -1309,9 +1734,15 @@ def main():
             "text/csv"
         )
 
-    st.divider()
-    st.caption("🏥 Pharmacy Desert Explorer | GLM + Walgreens Portfolio + Mathematical Modes")
-    st.caption("Built with Streamlit | Data refreshed on page load")
+    st.markdown(
+        """
+        <div class="pd-footer">
+            Pharmacy Desert Explorer | Hybrid AI + Mathematical Approach<br/>
+            Built with Streamlit | Data refreshed on page load
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
