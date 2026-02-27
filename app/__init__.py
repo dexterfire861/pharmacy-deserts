@@ -16,6 +16,7 @@ from .state import (
     load_glm_results,
     load_latlon_lookup,
     load_pharmacist_data_only,
+    load_pharmacy_data_only,
     get_glm_model_info,
     # Dataset config loading
     get_active_dataset_id,
@@ -45,6 +46,7 @@ __all__ = [
     'load_glm_results',
     'load_latlon_lookup',
     'load_pharmacist_data_only',
+    'load_pharmacy_data_only',
     'get_glm_model_info',
     # State - Dataset config loading
     'get_active_dataset_id',

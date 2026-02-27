@@ -28,7 +28,8 @@ from data.loaders import (
     read_financial_data, read_health_data, read_pharmacy_data, read_population_data,
     read_hhi_excel, read_population_labels,
     read_education_data_acs, read_hud_zip_county_crosswalk, read_county_desert_csv,
-    downscale_county_to_zip, load_all_pharmacist_data
+    downscale_county_to_zip, load_all_pharmacist_data, load_npi_pharmacist_data,
+    load_npi_pharmacy_data
 )
 from data.features import preprocess
 
@@ -424,6 +425,7 @@ def load_pharmacist_data_only():
         DataFrame with pharmacist data (empty if not found)
     """
     config = get_config()
+    auto_build_nppes = os.getenv("NPPES_AUTO_BUILD", "false").lower() == "true"
     
     try:
         if _is_s3_environment():
@@ -436,6 +438,10 @@ def load_pharmacist_data_only():
             local_path = download_s3_directory(bucket, key.rstrip('/') + '/', temp_dir)
             return load_all_pharmacist_data(local_path)
         else:
+            npi_df = load_npi_pharmacist_data("raw_data", auto_build=auto_build_nppes)
+            if not npi_df.empty:
+                return npi_df
+
             raw_data_path = Path('raw_data')
             if not raw_data_path.exists():
                 logger.warning(f"Raw data directory not found: {raw_data_path}")
@@ -444,6 +450,59 @@ def load_pharmacist_data_only():
     except Exception as e:
         logger.warning(f"Failed to load pharmacist data: {e}")
         return pd.DataFrame(columns=['Short_ZIP'])
+
+
+@st.cache_data(show_spinner="Loading pharmacy detail data...")
+def load_pharmacy_data_only():
+    """
+    Load detailed pharmacy-location data for map ZIP popups.
+
+    Prefers NPPES-derived pharmacy details when available, then falls back to
+    legacy pharmacy files.
+    """
+    try:
+        auto_build_nppes = os.getenv("NPPES_AUTO_BUILD", "false").lower() == "true"
+        if not _is_s3_environment():
+            npi_df = load_npi_pharmacy_data("raw_data", auto_build=auto_build_nppes)
+            if not npi_df.empty:
+                return npi_df
+
+            # Legacy fallback: derive a minimal popup table from core pharmacy data.
+            legacy_path = Path("raw_data/Pharmacy_list_ZIP_fixed_final")
+            if legacy_path.exists():
+                legacy = read_pharmacy_data(str(legacy_path))
+            else:
+                legacy = pd.DataFrame()
+
+            if legacy is not None and not legacy.empty:
+                pharmacy_name_col = (
+                    legacy["pharmacy_name"].astype(str)
+                    if "pharmacy_name" in legacy.columns
+                    else pd.Series("", index=legacy.index, dtype="object")
+                )
+                state_col = (
+                    legacy["state"].astype(str)
+                    if "state" in legacy.columns
+                    else pd.Series("", index=legacy.index, dtype="object")
+                )
+                out = pd.DataFrame(
+                    {
+                        "Short_ZIP": legacy["zip"].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5),
+                        "pharmacy_name": pharmacy_name_col,
+                        "Phone": "",
+                        "Address": "",
+                        "City": "",
+                        "State": state_col,
+                        "Chain": "Independent",
+                    }
+                )
+                return out.dropna(subset=["Short_ZIP", "pharmacy_name"])
+
+        # S3 mode fallback currently unsupported for NPPES details.
+        return pd.DataFrame(columns=["Short_ZIP", "pharmacy_name", "Phone", "Address"])
+    except Exception as e:
+        logger.warning(f"Failed to load pharmacy detail data: {e}")
+        return pd.DataFrame(columns=["Short_ZIP", "pharmacy_name", "Phone", "Address"])
 
 
 def get_glm_model_info():

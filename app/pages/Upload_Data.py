@@ -163,6 +163,17 @@ FILL_UNCOVERED_LABELS = {
 
 DEFAULT_CUSTOM_FEATURE_WEIGHT = 0.05
 
+REVENUE_POTENTIAL_COLUMN_ALIASES = [
+    "Grand_total_without_cancer_insurace_paying",
+    "Grand_total_without_cancer_insurance_paying",
+]
+REVENUE_WITHOUT_INSURANCE_COLUMN_ALIASES = [
+    "Grand_total_without_cancer",
+]
+REVENUE_WITH_CANCER_COLUMN_ALIASES = [
+    "Grand_total_with_cancer",
+]
+
 
 def _normalize_skip_rows(value: int, default: int = 0) -> int:
     """Normalize skip_rows input to a safe non-negative int."""
@@ -175,6 +186,71 @@ def _normalize_skip_rows(value: int, default: int = 0) -> int:
 
 def _zip_mode_label(mode: str) -> str:
     return ZIP_NORMALIZATION_LABELS.get(mode, mode)
+
+
+def _normalized_col_key(col_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col_name or "").strip().lower()).strip("_")
+
+
+def _is_revenue_potential_column(col_name: str) -> bool:
+    """Detect revenue-potential columns from known names/patterns."""
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_POTENTIAL_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    if "revenue_potential" in normalized or "revenue_with_insurance" in normalized:
+        return True
+    return (
+        "grand_total" in normalized
+        and "without_cancer" in normalized
+        and ("insurace" in normalized or "insurance" in normalized)
+    )
+
+
+def _is_revenue_without_insurance_column(col_name: str) -> bool:
+    """Detect revenue columns representing values without insurance."""
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_WITHOUT_INSURANCE_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    if "revenue_without_insurance" in normalized:
+        return True
+    return (
+        "grand_total" in normalized
+        and "without_cancer" in normalized
+        and ("insurance" not in normalized and "insurace" not in normalized)
+    )
+
+
+def _is_revenue_with_cancer_column(col_name: str) -> bool:
+    normalized = _normalized_col_key(col_name)
+    if not normalized:
+        return False
+    aliases = {
+        _normalized_col_key(c)
+        for c in REVENUE_WITH_CANCER_COLUMN_ALIASES
+    }
+    if normalized in aliases:
+        return True
+    return "grand_total" in normalized and "with_cancer" in normalized
+
+
+def _is_revenue_metric_column(col_name: str) -> bool:
+    return (
+        _is_revenue_potential_column(col_name)
+        or _is_revenue_without_insurance_column(col_name)
+        or _is_revenue_with_cancer_column(col_name)
+    )
 
 
 def _is_numeric_scoring_candidate(values: pd.Series, min_valid_ratio: float = 0.50) -> bool:
@@ -231,11 +307,17 @@ def _coerce_numeric_like_series(
     return values, False
 
 
-def _read_custom_bytes(content: bytes, filename: str, skip_rows: int = 0) -> pd.DataFrame:
+def _read_custom_bytes(
+    content: bytes,
+    filename: str,
+    skip_rows: int = 0,
+    sheet_name: str | int | None = None,
+) -> pd.DataFrame:
     """Read a custom file from raw bytes (CSV or Excel)."""
     ext = Path(filename).suffix.lower()
     if ext in (".xlsx", ".xlsm", ".xls"):
-        df = pd.read_excel(io.BytesIO(content), skiprows=skip_rows)
+        selected_sheet = 0 if sheet_name in (None, "") else sheet_name
+        df = pd.read_excel(io.BytesIO(content), skiprows=skip_rows, sheet_name=selected_sheet)
     else:
         df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows)
     df.columns = [str(c).strip() for c in df.columns]
@@ -269,6 +351,12 @@ def _sanitize_column_prefix(value: str) -> str:
 def _suggest_short_feature_name(value: str, max_len: int = 40) -> str:
     """Generate a compact, readable output name for long source columns."""
     text = str(value or "").strip()
+    if _is_revenue_without_insurance_column(text):
+        return "revenue_without_insurance"
+    if _is_revenue_potential_column(text):
+        return "revenue_potential"
+    if _is_revenue_with_cancer_column(text):
+        return "revenue_with_cancer"
     text = text.replace("!!", " ")
     text = re.sub(
         r"\b(estimate|margin of error|civilian noninstitutionalized population|"
@@ -711,6 +799,7 @@ def main():
             with st.expander(f"📄 {cf.name}", expanded=True):
                 try:
                     ext = Path(cf.name).suffix.lower()
+                    selected_sheet_name: str | None = None
                     skip_rows = int(
                         st.number_input(
                             "Rows to skip before header",
@@ -724,7 +813,26 @@ def main():
 
                     cf.seek(0)
                     if ext in (".xlsx", ".xlsm", ".xls"):
-                        preview_df = pd.read_excel(cf, skiprows=skip_rows)
+                        excel_file = pd.ExcelFile(cf)
+                        sheet_options = excel_file.sheet_names
+                        default_sheet = prev_custom_meta.get("sheet_name")
+                        if default_sheet not in sheet_options:
+                            default_sheet = next(
+                                (s for s in sheet_options if "health" in s.lower()),
+                                sheet_options[0] if sheet_options else None,
+                            )
+                        if sheet_options:
+                            selected_sheet_name = st.selectbox(
+                                "Worksheet",
+                                options=sheet_options,
+                                index=sheet_options.index(default_sheet) if default_sheet in sheet_options else 0,
+                                key=f"custom_sheet_{file_key}",
+                            )
+                        preview_df = pd.read_excel(
+                            excel_file,
+                            sheet_name=selected_sheet_name if selected_sheet_name else 0,
+                            skiprows=skip_rows,
+                        )
                     else:
                         preview_df = pd.read_csv(cf, skiprows=skip_rows)
                     preview_df.columns = [str(c).strip() for c in preview_df.columns]
@@ -823,6 +931,16 @@ def main():
                         )
 
                         selected_default = prev_custom_meta.get("selected_columns") or feature_cols
+                        if not prev_custom_meta.get("selected_columns"):
+                            revenue_cols = [
+                                c
+                                for c in feature_cols
+                                if _is_revenue_potential_column(c) or _is_revenue_without_insurance_column(c)
+                            ]
+                            if not revenue_cols:
+                                revenue_cols = [c for c in feature_cols if _is_revenue_metric_column(c)]
+                            if revenue_cols:
+                                selected_default = revenue_cols
                         selected_default = [c for c in selected_default if c in feature_cols]
                         if not selected_default:
                             selected_default = feature_cols
@@ -834,6 +952,11 @@ def main():
                             key=f"custom_cols_{file_key}",
                             help="Only selected columns will be merged into the unified dataset.",
                         )
+                        if any(_is_revenue_metric_column(c) for c in selected_columns):
+                            st.caption(
+                                "Revenue column(s) detected. They will be merged by ZIP and "
+                                "available in scoring and map/table outputs."
+                            )
 
                         naming_options = ["auto_shorten", "keep_original", "custom_edit"]
                         default_naming_strategy = prev_custom_meta.get("naming_strategy", "auto_shorten")
@@ -914,6 +1037,8 @@ def main():
                         default_prefix = prev_custom_meta.get("column_prefix") or _sanitize_column_prefix(
                             Path(cf.name).stem
                         )
+                        if any(_is_revenue_metric_column(c) for c in selected_columns):
+                            default_prefix = prev_custom_meta.get("column_prefix") or "revenue"
                         column_prefix = st.text_input(
                             "Column prefix (recommended to avoid name collisions)",
                             value=default_prefix,
@@ -977,6 +1102,7 @@ def main():
                                     "name": cf.name,
                                     "content": cf.getvalue(),
                                     "skip_rows": skip_rows,
+                                    "sheet_name": selected_sheet_name if ext in (".xlsx", ".xlsm", ".xls") else None,
                                     "zip_col": zip_col,
                                     "zip_normalization_mode": zip_normalization_mode,
                                     "selected_columns": selected_columns,
@@ -1253,6 +1379,7 @@ def _process_and_save(
                     content,
                     fname,
                     skip_rows=_normalize_skip_rows(custom_meta_input.get("skip_rows", 0)),
+                    sheet_name=custom_meta_input.get("sheet_name"),
                 )
 
                 merge_meta = {
@@ -1295,6 +1422,7 @@ def _process_and_save(
                 custom_file_meta.append({
                     "filename": fname,
                     "skip_rows": _normalize_skip_rows(custom_meta_input.get("skip_rows", 0)),
+                    "sheet_name": custom_meta_input.get("sheet_name"),
                     "zip_col": merge_meta["zip_col"],
                     "zip_normalization_mode": prep_info["zip_normalization_mode"],
                     "selected_columns": custom_meta_input.get("selected_columns"),

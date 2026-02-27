@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 import sys
 import hashlib
+import re
 from pathlib import Path
 
 # Add parent directory to sys.path so we can import our modules
@@ -26,6 +27,7 @@ from app.state import (
     load_glm_results,
     load_latlon_lookup,
     load_pharmacist_data_only,
+    load_pharmacy_data_only,
     get_glm_model_info,
     get_available_datasets,
     get_active_dataset_id,
@@ -271,7 +273,57 @@ def _is_numeric_feature_candidate(values: pd.Series, min_valid_ratio: float = 0.
 
 def _format_feature_label(col_name: str) -> str:
     """Make custom feature column names easier to read in the UI."""
+    revenue_kind = _classify_revenue_column(str(col_name or ""))
+    if revenue_kind == "with_insurance":
+        return "Revenue (With Insurance) ($/year)"
+    if revenue_kind == "without_insurance":
+        return "Revenue (Without Insurance) ($/year)"
+    if revenue_kind == "with_cancer":
+        return "Revenue (With Cancer) ($/year)"
     return col_name.replace("__", " • ")
+
+
+def _normalize_col_key(col_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(col_name or "").lower()).strip("_")
+
+
+def _classify_revenue_column(col_name: str) -> str | None:
+    """
+    Classify a column as a revenue field.
+
+    Returns one of:
+    - with_insurance
+    - without_insurance
+    - with_cancer
+    """
+    normalized = _normalize_col_key(col_name)
+    if not normalized:
+        return None
+
+    has_insurance = ("insurance" in normalized) or ("insurace" in normalized)
+
+    if "revenue_with_insurance" in normalized:
+        return "with_insurance"
+    if "revenue_without_insurance" in normalized:
+        return "without_insurance"
+    if "revenue_with_cancer" in normalized:
+        return "with_cancer"
+    if "revenue_potential" in normalized:
+        return "with_insurance"
+
+    if "grand_total" in normalized and "without_cancer" in normalized:
+        if has_insurance:
+            return "with_insurance"
+        return "without_insurance"
+    if "grand_total" in normalized and "with_cancer" in normalized:
+        return "with_cancer"
+
+    # Fallback for user-renamed columns that still retain insurance keywords.
+    if "revenue" in normalized and has_insurance:
+        return "with_insurance"
+    if "revenue" in normalized and "without" in normalized:
+        return "without_insurance"
+    return None
 
 
 def main():
@@ -477,6 +529,7 @@ def main():
         
         # Load pharmacist data (needed for map popups)
         pharmacist_data = load_pharmacist_data_only()
+        pharmacy_detail_data = load_pharmacy_data_only()
         
         # Set up variables for GLM mode
         df = None  # Not used in GLM Only mode
@@ -524,6 +577,7 @@ def main():
             df, pharmacist_data, scoring_config_dict = load_smart_dataset_bundle(
                 current_dataset_id, dataset_version_hint
             )
+            pharmacy_detail_data = load_pharmacy_data_only()
             
             # Check if dataset is empty
             if df.empty or len(df) == 0:
@@ -546,7 +600,17 @@ def main():
             
             pharm_count = len(pharmacist_data) if not pharmacist_data.empty else 0
             unique_pharm_zips = pharmacist_data['Short_ZIP'].nunique() if not pharmacist_data.empty else 0
-            st.success(f"Data loaded successfully! Analyzing {len(df):,} ZIP codes | {pharm_count:,} pharmacist records from {unique_pharm_zips} ZIPs")
+            pharmacy_count = len(pharmacy_detail_data) if pharmacy_detail_data is not None and not pharmacy_detail_data.empty else 0
+            unique_pharmacy_zips = (
+                pharmacy_detail_data["Short_ZIP"].nunique()
+                if pharmacy_detail_data is not None and not pharmacy_detail_data.empty and "Short_ZIP" in pharmacy_detail_data.columns
+                else 0
+            )
+            st.success(
+                f"Data loaded successfully! Analyzing {len(df):,} ZIP codes | "
+                f"{pharm_count:,} pharmacist records from {unique_pharm_zips} ZIPs | "
+                f"{pharmacy_count:,} pharmacy records from {unique_pharmacy_zips} ZIPs"
+            )
             
             # Show scoring config info
             if is_using_dataset_config():
@@ -902,6 +966,34 @@ def main():
     for c in optional_cols:
         if c in ranked.columns and c not in show_cols:
             show_cols.append(c)
+
+    # Revenue metrics from uploaded health economics files (with/without insurance).
+    revenue_by_kind: dict[str, list[str]] = {
+        "with_insurance": [],
+        "without_insurance": [],
+        "with_cancer": [],
+    }
+    for col in ranked.columns:
+        revenue_kind = _classify_revenue_column(col)
+        if revenue_kind in revenue_by_kind:
+            revenue_by_kind[revenue_kind].append(col)
+
+    for revenue_kind in ["with_insurance", "without_insurance", "with_cancer"]:
+        candidates = revenue_by_kind[revenue_kind]
+        if not candidates:
+            continue
+        preferred = sorted(
+            candidates,
+            key=lambda c: (
+                "revenue_potential" not in _normalize_col_key(c),
+                "revenue_with_insurance" not in _normalize_col_key(c),
+                "revenue_without_insurance" not in _normalize_col_key(c),
+                "revenue_with_cancer" not in _normalize_col_key(c),
+                len(c),
+            ),
+        )[0]
+        if preferred not in show_cols:
+            show_cols.append(preferred)
     
     # Score columns
     for c in ['score', 'score_math', 'ai_score', 'final_score', 'desert_flag']:
@@ -959,7 +1051,11 @@ def main():
     if map_key not in st.session_state:
         st.session_state[map_key] = True
 
-    render_top10_map(ranked.head(10).copy(), pharmacist_df=pharmacist_data)
+    render_top10_map(
+        ranked.head(10).copy(),
+        pharmacist_df=pharmacist_data,
+        pharmacy_df=pharmacy_detail_data,
+    )
 
     # Export Results
     st.write("### Export Results")

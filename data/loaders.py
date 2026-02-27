@@ -4,6 +4,8 @@ Data loading functions for pharmacy desert analysis.
 Consolidates all read_* functions for CSV/Excel/API data sources.
 """
 import os
+import json
+import re
 import pandas as pd
 import numpy as np
 import openpyxl
@@ -561,3 +563,526 @@ def get_pharmacists_for_zip(zip_code, pharmacist_df):
     pharmacists.sort(key=lambda x: (not x[1], x[0].lower()))
 
     return pharmacists
+
+
+# =============================================================================
+# NPPES (NPI) Provider Detail Data
+# =============================================================================
+
+NPPES_COLUMNS = {
+    "npi": "NPI",
+    "first_name": "Provider First Name",
+    "last_name": "Provider Last Name (Legal Name)",
+    "org_name": "Provider Organization Name (Legal Business Name)",
+    "practice_address": "Provider First Line Business Practice Location Address",
+    "practice_city": "Provider Business Practice Location Address City Name",
+    "practice_state": "Provider Business Practice Location Address State Name",
+    "practice_postal": "Provider Business Practice Location Address Postal Code",
+    "mailing_state": "Provider Business Mailing Address State Name",
+    "mailing_postal": "Provider Business Mailing Address Postal Code",
+    "country_code": "Provider Business Practice Location Address Country Code (If outside U.S.)",
+    "taxonomy_1": "Healthcare Provider Taxonomy Code_1",
+    "phone": "Provider Business Practice Location Address Telephone Number",
+}
+
+PHARMACIST_TAXONOMY_CODES = {"183500000X"}
+PHARMACY_TAXONOMY_CODES = {
+    "333600000X",
+    "3336C0003X",
+    "3336I0012X",
+    "3336M0003X",
+    "3336L0003X",
+    "3336C0002X",
+    "332B00000X",
+}
+
+NPPES_CHAIN_PATTERNS = [
+    ("Walgreens", r"walgreen"),
+    ("CVS", r"\bcvs\b"),
+    ("Safeway", r"safeway"),
+    ("Pathmark", r"pathmark"),
+    ("Kaiser Permanente", r"kaiser permanente"),
+    ("Kroger", r"kroger"),
+    ("ShopRite", r"shoprite"),
+    ("Costco", r"costco"),
+    ("Health Mart", r"health mart"),
+    ("Good Neighbor", r"good neighbor"),
+    ("Walmart", r"walmart"),
+    ("Rite Aid", r"rite aid"),
+]
+
+NPPES_CACHE_SUBDIR = "npi_cache"
+NPPES_PHARMACIST_FILE = "pharmacists.csv.gz"
+NPPES_PHARMACY_FILE = "pharmacies.csv.gz"
+NPPES_META_FILE = "metadata.json"
+
+
+def _resolve_nppes_pfile_path(explicit_path: str | None = None) -> Path | None:
+    """Resolve NPPES pfile path from explicit value, env var, or common local locations."""
+    if explicit_path:
+        explicit_candidate = Path(explicit_path).expanduser()
+        if explicit_candidate.exists() and explicit_candidate.is_file():
+            return explicit_candidate
+
+    env_path = os.getenv("NPPES_PFILE_PATH", "").strip()
+    if env_path:
+        env_candidate = Path(env_path).expanduser()
+        if env_candidate.exists() and env_candidate.is_file():
+            return env_candidate
+
+    candidates: list[Path] = []
+
+    candidates.extend(Path("raw_data").glob("npidata_pfile_*.csv"))
+    candidates.extend(Path.home().glob("Downloads/**/npidata_pfile_*.csv"))
+
+    existing = [p for p in candidates if p.exists() and p.is_file()]
+    if not existing:
+        return None
+
+    # Prefer newest candidate (works well when users keep monthly NPPES drops).
+    existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return existing[0]
+
+
+def _compute_short_zip_series(primary_postal: pd.Series, fallback_postal: pd.Series) -> pd.Series:
+    """
+    Convert postal values to 5-digit short ZIPs using notebook-compatible rules.
+
+    Rules:
+    - 1..4 digits -> zero-pad to 5
+    - 5 digits -> keep as-is
+    - 6 digits -> first 2, then zero-pad
+    - 7 digits -> first 3, then zero-pad
+    - 8 digits -> first 4, then zero-pad
+    - 9+ digits -> first 5
+    """
+    def _normalize_one(series: pd.Series) -> pd.Series:
+        digits = series.fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        n = digits.str.len()
+        out = pd.Series("", index=digits.index, dtype="object")
+
+        mask = (n >= 1) & (n <= 4)
+        out.loc[mask] = digits.loc[mask].str.zfill(5)
+
+        mask = n == 5
+        out.loc[mask] = digits.loc[mask]
+
+        mask = n == 6
+        out.loc[mask] = digits.loc[mask].str[:2].str.zfill(5)
+
+        mask = n == 7
+        out.loc[mask] = digits.loc[mask].str[:3].str.zfill(5)
+
+        mask = n == 8
+        out.loc[mask] = digits.loc[mask].str[:4].str.zfill(5)
+
+        mask = n >= 9
+        out.loc[mask] = digits.loc[mask].str[:5]
+        return out
+
+    primary = _normalize_one(primary_postal)
+    fallback = _normalize_one(fallback_postal)
+    combined = primary.where(primary.str.len() > 0, fallback)
+    return combined.where(combined.str.fullmatch(r"\d{5}", na=False), "")
+
+
+def _detect_chain_series(org_name: pd.Series) -> pd.Series:
+    """Classify pharmacy chain from organization name."""
+    names = org_name.fillna("").astype(str)
+    chain = pd.Series("Independent", index=names.index, dtype="object")
+    for label, pattern in NPPES_CHAIN_PATTERNS:
+        mask = names.str.contains(pattern, case=False, na=False) & (chain == "Independent")
+        chain.loc[mask] = label
+    return chain
+
+
+def _build_person_name_series(first_name: pd.Series, last_name: pd.Series) -> pd.Series:
+    """Build display names from first/last name columns."""
+    first = first_name.fillna("").astype(str).str.strip()
+    last = last_name.fillna("").astype(str).str.strip()
+    full = (first + " " + last).str.replace(r"\s+", " ", regex=True).str.strip()
+    return full
+
+
+def _format_phone_value(raw_value) -> str:
+    """Normalize phone number for display."""
+    if pd.isna(raw_value):
+        return ""
+    digits = re.sub(r"\D", "", str(raw_value))
+    if not digits:
+        return ""
+    if len(digits) >= 10:
+        d = digits[-10:]
+        return f"({d[:3]}) {d[3:6]}-{d[6:]}"
+    return digits
+
+
+def _read_nppes_cache_meta(meta_path: Path) -> dict:
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return {}
+
+
+def _write_nppes_cache_meta(meta_path: Path, payload: dict) -> None:
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, indent=2))
+
+
+def _append_csv_gz(frame: pd.DataFrame, out_path: Path, has_data: bool) -> bool:
+    """Append dataframe to gzipped CSV, writing headers only once."""
+    if frame is None or frame.empty:
+        return has_data
+    frame.to_csv(
+        out_path,
+        mode="a",
+        index=False,
+        header=not has_data,
+        compression="gzip",
+    )
+    return True
+
+
+def build_nppes_zip_detail_cache(
+    csv_path: str | Path,
+    cache_dir: str | Path = "raw_data/npi_cache",
+    chunksize: int = 250_000,
+    max_chunks: int | None = None,
+    force: bool = False,
+) -> dict:
+    """
+    Build compact pharmacist/pharmacy ZIP detail files from a large NPPES pfile.
+
+    Returns dictionary with cache file paths and row counts.
+    """
+    source = Path(csv_path).expanduser()
+    if not source.exists():
+        raise FileNotFoundError(f"NPPES source file not found: {source}")
+
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    pharmacist_out = cache_root / NPPES_PHARMACIST_FILE
+    pharmacy_out = cache_root / NPPES_PHARMACY_FILE
+    meta_path = cache_root / NPPES_META_FILE
+
+    source_info = {
+        "path": str(source.resolve()),
+        "size": int(source.stat().st_size),
+        "mtime": int(source.stat().st_mtime),
+    }
+
+    meta = _read_nppes_cache_meta(meta_path)
+    cache_current = (
+        meta.get("source") == source_info
+        and pharmacist_out.exists()
+        and pharmacy_out.exists()
+    )
+    if cache_current and not force:
+        return {
+            "pharmacist_path": str(pharmacist_out),
+            "pharmacy_path": str(pharmacy_out),
+            "pharmacist_rows": int(meta.get("pharmacist_rows", 0)),
+            "pharmacy_rows": int(meta.get("pharmacy_rows", 0)),
+            "from_cache": True,
+        }
+
+    for p in (pharmacist_out, pharmacy_out):
+        if p.exists():
+            p.unlink()
+
+    header_cols = pd.read_csv(source, nrows=0).columns.tolist()
+    available = set(header_cols)
+    usecols = [col for col in NPPES_COLUMNS.values() if col in available]
+    missing_required = [
+        NPPES_COLUMNS["org_name"],
+        NPPES_COLUMNS["practice_postal"],
+        NPPES_COLUMNS["mailing_postal"],
+        NPPES_COLUMNS["country_code"],
+        NPPES_COLUMNS["taxonomy_1"],
+    ]
+    if any(c not in available for c in missing_required):
+        missing = [c for c in missing_required if c not in available]
+        raise ValueError(f"NPPES file missing required columns: {missing}")
+
+    has_pharmacist_data = False
+    has_pharmacy_data = False
+    pharmacist_rows = 0
+    pharmacy_rows = 0
+
+    reader = pd.read_csv(
+        source,
+        usecols=usecols,
+        dtype={col: "string" for col in usecols},
+        chunksize=chunksize,
+        low_memory=True,
+    )
+
+    for chunk_idx, chunk in enumerate(reader):
+        if max_chunks is not None and chunk_idx >= max_chunks:
+            break
+
+        chunk = chunk.copy()
+
+        country = chunk[NPPES_COLUMNS["country_code"]].fillna("").astype(str).str.upper().str.strip()
+        chunk = chunk[country == "US"].copy()
+        if chunk.empty:
+            continue
+
+        if NPPES_COLUMNS["mailing_state"] in chunk.columns:
+            mailing_state = chunk[NPPES_COLUMNS["mailing_state"]].fillna("").astype(str).str.upper().str.strip()
+            chunk = chunk[~mailing_state.isin({"PR", "VI"})].copy()
+        if chunk.empty:
+            continue
+
+        if NPPES_COLUMNS["practice_state"] in chunk.columns:
+            practice_state = chunk[NPPES_COLUMNS["practice_state"]].fillna("").astype(str).str.upper().str.strip()
+            chunk = chunk[~practice_state.isin({"PR", "VI"})].copy()
+        if chunk.empty:
+            continue
+
+        short_zip = _compute_short_zip_series(
+            chunk[NPPES_COLUMNS["practice_postal"]],
+            chunk[NPPES_COLUMNS["mailing_postal"]],
+        )
+        chunk["Short_ZIP"] = short_zip
+        chunk = chunk[chunk["Short_ZIP"].str.fullmatch(r"\d{5}", na=False)].copy()
+        if chunk.empty:
+            continue
+
+        taxonomy = chunk[NPPES_COLUMNS["taxonomy_1"]].fillna("").astype(str).str.upper().str.strip()
+        org_name = chunk[NPPES_COLUMNS["org_name"]].fillna("").astype(str).str.strip()
+        chain = _detect_chain_series(org_name)
+        first_name = (
+            chunk[NPPES_COLUMNS["first_name"]].fillna("").astype(str).str.strip()
+            if NPPES_COLUMNS["first_name"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+        last_name = (
+            chunk[NPPES_COLUMNS["last_name"]].fillna("").astype(str).str.strip()
+            if NPPES_COLUMNS["last_name"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+        person_name = _build_person_name_series(first_name, last_name)
+
+        npi_col = chunk[NPPES_COLUMNS["npi"]].fillna("").astype(str).str.strip()
+        phone_col = (
+            chunk[NPPES_COLUMNS["phone"]].fillna("").astype(str)
+            if NPPES_COLUMNS["phone"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+        practice_addr = (
+            chunk[NPPES_COLUMNS["practice_address"]].fillna("").astype(str).str.strip()
+            if NPPES_COLUMNS["practice_address"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+        practice_city = (
+            chunk[NPPES_COLUMNS["practice_city"]].fillna("").astype(str).str.strip()
+            if NPPES_COLUMNS["practice_city"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+        practice_state = (
+            chunk[NPPES_COLUMNS["practice_state"]].fillna("").astype(str).str.strip()
+            if NPPES_COLUMNS["practice_state"] in chunk.columns
+            else pd.Series("", index=chunk.index, dtype="object")
+        )
+
+        pharmacist_mask = taxonomy.isin(PHARMACIST_TAXONOMY_CODES)
+        if pharmacist_mask.any():
+            pharmacist_names = person_name.loc[pharmacist_mask].replace("", pd.NA)
+            pharmacist_names = pharmacist_names.fillna(org_name.loc[pharmacist_mask].replace("", pd.NA))
+            pharmacist_names = pharmacist_names.fillna(npi_col.loc[pharmacist_mask])
+            pharmacist_frame = pd.DataFrame(
+                {
+                    "Short_ZIP": chunk.loc[pharmacist_mask, "Short_ZIP"].astype(str),
+                    "Combined": pharmacist_names,
+                    "Award": 0,
+                    "Phone": phone_col.loc[pharmacist_mask].map(_format_phone_value),
+                    "Address": practice_addr.loc[pharmacist_mask],
+                    "City": practice_city.loc[pharmacist_mask],
+                    "State": practice_state.loc[pharmacist_mask],
+                    "NPI": npi_col.loc[pharmacist_mask],
+                    "Taxonomy": taxonomy.loc[pharmacist_mask],
+                    "Chain": chain.loc[pharmacist_mask],
+                }
+            ).dropna(subset=["Short_ZIP", "Combined"])
+
+            pharmacist_frame["Combined"] = pharmacist_frame["Combined"].astype(str).str.strip()
+            pharmacist_frame = pharmacist_frame[pharmacist_frame["Combined"] != ""]
+            pharmacist_frame = pharmacist_frame.drop_duplicates(
+                subset=["Short_ZIP", "Combined", "Address", "Phone"]
+            )
+
+            has_pharmacist_data = _append_csv_gz(pharmacist_frame, pharmacist_out, has_pharmacist_data)
+            pharmacist_rows += len(pharmacist_frame)
+
+        pharmacy_mask = taxonomy.isin(PHARMACY_TAXONOMY_CODES)
+        if pharmacy_mask.any():
+            pharmacy_frame = pd.DataFrame(
+                {
+                    "Short_ZIP": chunk.loc[pharmacy_mask, "Short_ZIP"].astype(str),
+                    "pharmacy_name": org_name.loc[pharmacy_mask].replace("", pd.NA).fillna(npi_col.loc[pharmacy_mask]),
+                    "Phone": phone_col.loc[pharmacy_mask].map(_format_phone_value),
+                    "Address": practice_addr.loc[pharmacy_mask],
+                    "City": practice_city.loc[pharmacy_mask],
+                    "State": practice_state.loc[pharmacy_mask],
+                    "NPI": npi_col.loc[pharmacy_mask],
+                    "Taxonomy": taxonomy.loc[pharmacy_mask],
+                    "Chain": chain.loc[pharmacy_mask],
+                }
+            ).dropna(subset=["Short_ZIP", "pharmacy_name"])
+
+            pharmacy_frame["pharmacy_name"] = pharmacy_frame["pharmacy_name"].astype(str).str.strip()
+            pharmacy_frame = pharmacy_frame[pharmacy_frame["pharmacy_name"] != ""]
+            pharmacy_frame = pharmacy_frame.drop_duplicates(
+                subset=["Short_ZIP", "pharmacy_name", "Address", "Phone"]
+            )
+
+            has_pharmacy_data = _append_csv_gz(pharmacy_frame, pharmacy_out, has_pharmacy_data)
+            pharmacy_rows += len(pharmacy_frame)
+
+    if not pharmacist_out.exists():
+        pd.DataFrame(
+            columns=["Short_ZIP", "Combined", "Award", "Phone", "Address", "City", "State", "NPI", "Taxonomy", "Chain"]
+        ).to_csv(pharmacist_out, index=False, compression="gzip")
+    if not pharmacy_out.exists():
+        pd.DataFrame(
+            columns=["Short_ZIP", "pharmacy_name", "Phone", "Address", "City", "State", "NPI", "Taxonomy", "Chain"]
+        ).to_csv(pharmacy_out, index=False, compression="gzip")
+
+    meta_payload = {
+        "source": source_info,
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "chunksize": int(chunksize),
+        "pharmacist_rows": int(pharmacist_rows),
+        "pharmacy_rows": int(pharmacy_rows),
+        "pharmacist_taxonomy_codes": sorted(PHARMACIST_TAXONOMY_CODES),
+        "pharmacy_taxonomy_codes": sorted(PHARMACY_TAXONOMY_CODES),
+    }
+    _write_nppes_cache_meta(meta_path, meta_payload)
+
+    return {
+        "pharmacist_path": str(pharmacist_out),
+        "pharmacy_path": str(pharmacy_out),
+        "pharmacist_rows": pharmacist_rows,
+        "pharmacy_rows": pharmacy_rows,
+        "from_cache": False,
+    }
+
+
+@cache_data
+def load_npi_pharmacist_data(
+    data_dir: str = "raw_data",
+    nppes_csv_path: str | None = None,
+    auto_build: bool = False,
+) -> pd.DataFrame:
+    """
+    Load pharmacist detail data derived from NPPES.
+
+    If cache files are missing and *auto_build* is True, this will build them
+    from the newest available NPPES pfile.
+    """
+    cache_root = Path(data_dir) / NPPES_CACHE_SUBDIR
+    pharmacist_path = cache_root / NPPES_PHARMACIST_FILE
+
+    if not pharmacist_path.exists() and auto_build:
+        resolved = _resolve_nppes_pfile_path(nppes_csv_path)
+        if resolved:
+            try:
+                build_nppes_zip_detail_cache(resolved, cache_root, force=False)
+            except Exception as e:
+                print(f"Warning: failed to build NPPES pharmacist cache: {e}")
+
+    if not pharmacist_path.exists():
+        return pd.DataFrame(columns=["Short_ZIP", "Combined", "Award", "Phone", "Address"])
+
+    df = pd.read_csv(
+        pharmacist_path,
+        compression="gzip",
+        dtype={"Short_ZIP": str, "Combined": str, "Award": object, "Phone": str, "Address": str},
+        low_memory=False,
+    )
+    if "Short_ZIP" in df.columns:
+        df["Short_ZIP"] = df["Short_ZIP"].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    if "Award" not in df.columns:
+        df["Award"] = 0
+    if "Phone" not in df.columns:
+        df["Phone"] = ""
+    if "Address" not in df.columns:
+        df["Address"] = ""
+    if "Combined" not in df.columns:
+        df["Combined"] = ""
+    return df.dropna(subset=["Short_ZIP", "Combined"])
+
+
+@cache_data
+def load_npi_pharmacy_data(
+    data_dir: str = "raw_data",
+    nppes_csv_path: str | None = None,
+    auto_build: bool = False,
+) -> pd.DataFrame:
+    """
+    Load pharmacy detail data derived from NPPES.
+
+    If cache files are missing and *auto_build* is True, this will build them
+    from the newest available NPPES pfile.
+    """
+    cache_root = Path(data_dir) / NPPES_CACHE_SUBDIR
+    pharmacy_path = cache_root / NPPES_PHARMACY_FILE
+
+    if not pharmacy_path.exists() and auto_build:
+        resolved = _resolve_nppes_pfile_path(nppes_csv_path)
+        if resolved:
+            try:
+                build_nppes_zip_detail_cache(resolved, cache_root, force=False)
+            except Exception as e:
+                print(f"Warning: failed to build NPPES pharmacy cache: {e}")
+
+    if not pharmacy_path.exists():
+        return pd.DataFrame(columns=["Short_ZIP", "pharmacy_name", "Phone", "Address"])
+
+    df = pd.read_csv(
+        pharmacy_path,
+        compression="gzip",
+        dtype={"Short_ZIP": str, "pharmacy_name": str, "Phone": str, "Address": str},
+        low_memory=False,
+    )
+    if "Short_ZIP" in df.columns:
+        df["Short_ZIP"] = df["Short_ZIP"].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+    if "pharmacy_name" not in df.columns:
+        df["pharmacy_name"] = ""
+    if "Phone" not in df.columns:
+        df["Phone"] = ""
+    if "Address" not in df.columns:
+        df["Address"] = ""
+    return df.dropna(subset=["Short_ZIP", "pharmacy_name"])
+
+
+@cache_data
+def get_pharmacies_for_zip(zip_code, pharmacy_df):
+    """
+    Get all pharmacies in a specific ZIP code.
+    Returns list of tuples: (pharmacy_name, chain, phone, address)
+    """
+    if pharmacy_df is None or pharmacy_df.empty:
+        return []
+
+    zip_str = str(zip_code).strip()
+    zip_data = pharmacy_df[pharmacy_df["Short_ZIP"].astype(str).str.strip() == zip_str]
+    if zip_data.empty:
+        return []
+
+    pharmacies = []
+    for _, row in zip_data.iterrows():
+        name = str(row.get("pharmacy_name", "")).strip()
+        if not name:
+            continue
+        chain = str(row.get("Chain", "Independent")).strip() or "Independent"
+        phone = _format_phone_value(row.get("Phone", ""))
+        address = str(row.get("Address", "")).strip() if pd.notna(row.get("Address")) else ""
+        pharmacies.append((name, chain, phone, address))
+
+    # Chain-affiliated pharmacies first, then alphabetical.
+    pharmacies.sort(key=lambda x: (x[1] == "Independent", x[0].lower()))
+    return pharmacies
