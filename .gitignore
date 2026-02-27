@@ -48,7 +48,8 @@ ENV/
 .LSOverride
 
 # Streamlit
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 
 # Local data directories - users upload their own data through the app
 raw_data/
@@ -79,4 +80,3 @@ tmp/
 # OS
 .DS_Store
 Thumbs.db
-

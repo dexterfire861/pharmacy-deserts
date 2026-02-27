@@ -23,6 +23,7 @@ if str(parent_dir) not in sys.path:
 
 from app.config import get_config
 from app.auth import is_authenticated, login_form
+from app.design_system import apply_global_design_system
 from data.loaders import (
     read_financial_data, read_health_data,
     read_population_data, read_hhi_excel, read_education_data_acs,
@@ -654,6 +655,7 @@ def _read_pharmacy_upload(
 # ── Main page ────────────────────────────────────────────────────────────────
 
 def main():
+    apply_global_design_system(top_padding_rem=1.0, bottom_padding_rem=1.5)
     st.title("Upload Data")
     st.markdown(
         "Upload your data files to build the analysis dataset. "

@@ -1,20 +1,12 @@
 # pharmacy_deserts/viz/map_viz.py
 import pandas as pd
 import streamlit as st
-from data.loaders import read_population_labels, get_pharmacists_for_zip, get_pharmacies_for_zip
+from data.loaders import read_population_labels
 from app.config import get_config
 import re
 import json
+import html
 from pathlib import Path
-
-# Import health data parser
-try:
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / 'raw_data'))
-    from health_data_parser import format_health_stats_html
-except ImportError:
-    def format_health_stats_html(zip_code):
-        return ""  # Fallback if health data not available
 
 
 def _parse_city_state_from_csv(path, skiprows=10):
@@ -342,6 +334,177 @@ def _load_revenue_presets() -> pd.DataFrame:
     return empty
 
 
+def _get_row_value(row: pd.Series, column_name: str):
+    raw = row.get(column_name)
+    if isinstance(raw, pd.Series):
+        return raw.iloc[0] if len(raw) else None
+    return raw
+
+
+def _pick_text_value(row: pd.Series, candidate_columns: list[str]) -> str | None:
+    for col in candidate_columns:
+        if col not in row.index:
+            continue
+        raw = _get_row_value(row, col)
+        if raw is None or pd.isna(raw):
+            continue
+        text = str(raw).strip()
+        if text and text.lower() != "nan":
+            return text
+    return None
+
+
+def _pick_numeric_value(row: pd.Series, candidate_columns: list[str]) -> float | None:
+    for col in candidate_columns:
+        if col in row.index:
+            value = _extract_numeric_from_row(row, col)
+            if value is not None:
+                return value
+    return None
+
+
+def _format_decimal(value: float | None, digits: int = 3) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):.{digits}f}"
+
+
+def _format_int(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{int(round(float(value))):,}"
+
+
+def _format_income(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"${float(value):,.0f}"
+
+
+def _as_yes_no(value) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y"}:
+            return "Yes"
+        if lowered in {"0", "false", "no", "n"}:
+            return "No"
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.notna(numeric):
+        return "Yes" if float(numeric) >= 0.5 else "No"
+    return "N/A"
+
+
+def _detect_popup_mode(row: pd.Series) -> str:
+    if (
+        "store_viability" in row.index
+        or "action" in row.index
+        or "archetype_name" in row.index
+    ):
+        return "optimizer"
+    if (
+        "profit_score" in row.index
+        or "revenue_potential" in row.index
+        or "capture_rate" in row.index
+    ):
+        return "profit"
+    return "default"
+
+
+def _build_compact_popup_html(row: pd.Series, place: str) -> str:
+    mode = _detect_popup_mode(row)
+    zip_code = _normalize_zip_value(_get_row_value(row, "zip")) or str(_get_row_value(row, "zip") or "N/A")
+    state = _pick_text_value(row, ["state", "st"])
+    if not state and "," in place:
+        state = place.split(",")[-1].strip()
+    state = state or "N/A"
+
+    rows: list[tuple[str, str]] = [("ZCTA / State", f"{zip_code} / {state}")]
+
+    if mode == "profit":
+        profit_score = _pick_numeric_value(row, ["profit_score", "final_score", "score"])
+        tier = _pick_text_value(row, ["tier"])
+        score_text = _format_decimal(profit_score)
+        if tier:
+            score_text = f"{score_text} ({tier})"
+        rows.extend(
+            [
+                ("Profit Score / Tier", score_text),
+                (
+                    "Population / Pop density",
+                    f"{_format_int(_pick_numeric_value(row, ['population']))} / {_format_decimal(_pick_numeric_value(row, ['pop_density', 'density']), 1)}",
+                ),
+                ("Median income", _format_income(_pick_numeric_value(row, ["median_income", "income"]))),
+                ("Pharmacies in ZCTA", _format_int(_pick_numeric_value(row, ["n_pharmacies", "pharmacies_count", "total_pharmacies"]))),
+                ("Revenue potential", _format_decimal(_pick_numeric_value(row, ["revenue_potential"]))),
+                ("Cost pressure", _format_decimal(_pick_numeric_value(row, ["cost_pressure"]))),
+                ("Capture rate", _format_decimal(_pick_numeric_value(row, ["capture_rate"]))),
+                ("Pharmacy desert", _as_yes_no(_get_row_value(row, "is_pharmacy_desert") if "is_pharmacy_desert" in row.index else _get_row_value(row, "desert_flag"))),
+            ]
+        )
+        title = "Profit Model Summary"
+    elif mode == "optimizer":
+        walgreens_count = _pick_numeric_value(row, ["walgreens_count"])
+        total_pharmacies = _pick_numeric_value(row, ["total_pharmacies", "n_pharmacies", "pharmacies_count"])
+        non_walgreens = _pick_numeric_value(row, ["non_walgreens_count"])
+        if non_walgreens is None and walgreens_count is not None and total_pharmacies is not None:
+            non_walgreens = max(0.0, float(total_pharmacies) - float(walgreens_count))
+
+        rows.extend(
+            [
+                ("Viability Score", _format_decimal(_pick_numeric_value(row, ["store_viability", "final_score", "score"]))),
+                ("Action", _pick_text_value(row, ["action"]) or "N/A"),
+                ("Archetype", _pick_text_value(row, ["archetype_name", "archetype"]) or "N/A"),
+                ("Population", _format_int(_pick_numeric_value(row, ["population"]))),
+                ("Median income", _format_income(_pick_numeric_value(row, ["median_income", "income"]))),
+                ("Walgreens count", _format_int(walgreens_count)),
+                ("Non-Walgreens count", _format_int(non_walgreens)),
+                ("Revenue", _format_decimal(_pick_numeric_value(row, ["store_revenue", "revenue"]))),
+                ("Cost", _format_decimal(_pick_numeric_value(row, ["store_cost", "cost"]))),
+                ("Position", _format_decimal(_pick_numeric_value(row, ["store_position", "position"]))),
+            ]
+        )
+        title = "Optimization Model Summary"
+    else:
+        rows.extend(
+            [
+                ("Final Score", _format_decimal(_pick_numeric_value(row, ["final_score", "score"]))),
+                ("Population", _format_int(_pick_numeric_value(row, ["population"]))),
+                ("Median income", _format_income(_pick_numeric_value(row, ["median_income", "income"]))),
+                ("Pharmacies in ZCTA", _format_int(_pick_numeric_value(row, ["n_pharmacies", "pharmacies_count", "total_pharmacies"]))),
+            ]
+        )
+        title = "ZIP Summary"
+
+    rows_html = "".join(
+        [
+            (
+                "<div style='margin: 0 0 4px 0; white-space: nowrap;'>"
+                f"<span style='font-weight: 600;'>{html.escape(label)}:</span> "
+                f"{html.escape(value)}"
+                "</div>"
+            )
+            for label, value in rows
+        ]
+    )
+
+    return (
+        "<div style='"
+        "font-family: Helvetica, Arial, sans-serif;"
+        "font-size: 13px;"
+        "line-height: 1.35;"
+        "color: #111111;"
+        "white-space: nowrap;"
+        "min-width: 360px;"
+        "max-width: 520px;"
+        "'>"
+        f"<div style='font-size: 14px; font-weight: 600; margin: 0 0 7px 0; white-space: nowrap;'>{html.escape(title)}</div>"
+        f"{rows_html}"
+        "</div>"
+    )
+
+
 def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None, map_key: str = "pharmacy_map"):
     """
     Render an interactive map of top pharmacy desert ZIPs.
@@ -498,11 +661,20 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None, 
         bounds = bounds_df[["lat","lon"]].values.tolist()
         if bounds: fmap.fit_bounds(bounds, padding=(20, 20))
 
-        revenue_presets = _load_revenue_presets()
-        revenue_lookup = (
-            revenue_presets.set_index("zip")[["with_insurance", "without_insurance"]].to_dict("index")
-            if not revenue_presets.empty
-            else {}
+        fmap.get_root().html.add_child(
+            folium.Element(
+                """
+                <style>
+                .leaflet-popup-content-wrapper {
+                    border-radius: 10px !important;
+                }
+                .leaflet-popup-content {
+                    margin: 10px 12px !important;
+                    width: auto !important;
+                }
+                </style>
+                """
+            )
         )
 
         for _, r in pts.iterrows():
@@ -531,169 +703,10 @@ def render_top10_map(top10: pd.DataFrame, pharmacist_df=None, pharmacy_df=None, 
             except (ValueError, TypeError):
                 continue  # Skip this row if lat/lon can't be converted
             place = (f'{r.get("city","")}, {r.get("state","")}'.strip(", ") or "(unknown)")
-            drive_time_html = ""
-            if ('zip_drive_time' in r.index) and pd.notna(r.get('zip_drive_time')):
-                drive_time_html = f"<b>🚗 Drive Time:</b> {r['zip_drive_time']:.1f} min<br>"
-            revenue_values = _extract_revenue_values(r)
-            # Hard-coded ZIP preset values take precedence when available.
-            zip_for_lookup = _normalize_zip_value(r.get("zip"))
-            if zip_for_lookup and zip_for_lookup in revenue_lookup:
-                preset_values = revenue_lookup.get(zip_for_lookup, {})
-                preset_with = pd.to_numeric(preset_values.get("with_insurance"), errors="coerce")
-                preset_without = pd.to_numeric(preset_values.get("without_insurance"), errors="coerce")
-                if pd.notna(preset_with):
-                    revenue_values["with_insurance"] = float(preset_with)
-                if pd.notna(preset_without):
-                    revenue_values["without_insurance"] = float(preset_without)
-            revenue_html_lines = []
-            if revenue_values["with_insurance"] is not None:
-                revenue_html_lines.append(
-                    f"<b>💰 Revenue (With Insurance):</b> ${revenue_values['with_insurance']:,.0f}<br>"
-                )
-            if revenue_values["without_insurance"] is not None:
-                revenue_html_lines.append(
-                    f"<b>💵 Revenue (Without Insurance):</b> ${revenue_values['without_insurance']:,.0f}<br>"
-                )
-            revenue_html = "".join(revenue_html_lines)
-            
-            # Get pharmacists for this ZIP
-            pharmacist_html = ""
-            if pharmacist_df is not None and not pharmacist_df.empty:
-                pharmacists = get_pharmacists_for_zip(r['zip'], pharmacist_df)
-                if pharmacists:
-                    pharmacist_count = len(pharmacists)
-
-                    awarded_count = sum(1 for _, has_award, _, _ in pharmacists if has_award)
-                    award_note = (
-                        f" ({awarded_count} award winner{'s' if awarded_count != 1 else ''} ⭐)"
-                        if awarded_count > 0
-                        else ""
-                    )
-
-                    table_rows = []
-                    for idx, (name, has_award, phone, address) in enumerate(pharmacists, 1):
-                        award_badge = '<span style="color: #FFD700; font-size: 12px;">⭐</span>' if has_award else ''
-                        display_address = (
-                            address[:35] + '...' if len(address) > 35
-                            else address if address
-                            else '<span style="color: #999;">—</span>'
-                        )
-                        display_phone = phone if phone else '<span style="color: #999;">—</span>'
-
-                        table_rows.append(
-                            f'<tr style="border-bottom: 1px solid #e8e8e8;">'
-                            f'<td style="padding: 4px 4px; text-align: center; color: #666; font-size: 10px;">{idx}</td>'
-                            f'<td style="padding: 4px 6px; font-size: 11px; font-weight: {("bold" if has_award else "normal")};">{name}</td>'
-                            f'<td style="padding: 4px 4px; font-size: 9px; color: #555;">{display_phone}</td>'
-                            f'<td style="padding: 4px 4px; font-size: 9px; color: #555;">{display_address}</td>'
-                            f'<td style="padding: 4px 3px; text-align: center;">{award_badge}</td>'
-                            f'</tr>'
-                        )
-
-                    table_html = f'''
-                        <div style="max-height: 180px; overflow-y: auto; overflow-x: hidden; margin-top: 6px; border: 1px solid #ddd; border-radius: 4px;">
-                            <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
-                                <thead style="position: sticky; top: 0; background-color: #f8f8f8; z-index: 1;">
-                                    <tr style="border-bottom: 2px solid #ccc;">
-                                        <th style="padding: 5px 4px; text-align: center; width: 22px; font-size: 9px;">#</th>
-                                        <th style="padding: 5px 6px; text-align: left; font-size: 9px;">Name</th>
-                                        <th style="padding: 5px 4px; text-align: left; width: 85px; font-size: 9px;">Phone</th>
-                                        <th style="padding: 5px 4px; text-align: left; width: 110px; font-size: 9px;">Location</th>
-                                        <th style="padding: 5px 3px; text-align: center; width: 25px; font-size: 9px;">⭐</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {''.join(table_rows)}
-                                </tbody>
-                            </table>
-                        </div>
-                    '''
-
-                    pharmacist_html = (
-                        f"<br><b style='font-size: 12px;'>👨‍⚕️ Pharmacists "
-                        f"({pharmacist_count} total{award_note}):</b>{table_html}"
-                    )
-                else:
-                    pharmacist_html = "<br><b style='font-size: 12px;'>👨‍⚕️ Pharmacists:</b> <i>None found</i>"
-            else:
-                pharmacist_html = "<br><b style='font-size: 12px;'>👨‍⚕️ Pharmacists:</b> <i>Data not loaded</i>"
-
-            # Get pharmacies for this ZIP
-            pharmacy_html = ""
-            if pharmacy_df is not None and not pharmacy_df.empty:
-                pharmacies = get_pharmacies_for_zip(r["zip"], pharmacy_df)
-                if pharmacies:
-                    pharmacy_rows = []
-                    for idx, (name, chain, phone, address) in enumerate(pharmacies, 1):
-                        display_phone = phone if phone else '<span style="color: #999;">—</span>'
-                        display_address = (
-                            address[:35] + "..." if len(address) > 35
-                            else address if address
-                            else '<span style="color: #999;">—</span>'
-                        )
-                        chain_badge = chain if chain and chain != "Independent" else "Independent"
-                        pharmacy_rows.append(
-                            f'<tr style="border-bottom: 1px solid #e8e8e8;">'
-                            f'<td style="padding: 4px 4px; text-align: center; color: #666; font-size: 10px;">{idx}</td>'
-                            f'<td style="padding: 4px 6px; font-size: 11px;">{name}</td>'
-                            f'<td style="padding: 4px 4px; font-size: 9px; color: #555;">{chain_badge}</td>'
-                            f'<td style="padding: 4px 4px; font-size: 9px; color: #555;">{display_phone}</td>'
-                            f'<td style="padding: 4px 4px; font-size: 9px; color: #555;">{display_address}</td>'
-                            f"</tr>"
-                        )
-
-                    pharmacy_table_html = f'''
-                        <div style="max-height: 180px; overflow-y: auto; overflow-x: hidden; margin-top: 6px; border: 1px solid #ddd; border-radius: 4px;">
-                            <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
-                                <thead style="position: sticky; top: 0; background-color: #f8f8f8; z-index: 1;">
-                                    <tr style="border-bottom: 2px solid #ccc;">
-                                        <th style="padding: 5px 4px; text-align: center; width: 22px; font-size: 9px;">#</th>
-                                        <th style="padding: 5px 6px; text-align: left; font-size: 9px;">Pharmacy</th>
-                                        <th style="padding: 5px 4px; text-align: left; width: 70px; font-size: 9px;">Chain</th>
-                                        <th style="padding: 5px 4px; text-align: left; width: 85px; font-size: 9px;">Phone</th>
-                                        <th style="padding: 5px 4px; text-align: left; width: 110px; font-size: 9px;">Location</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {''.join(pharmacy_rows)}
-                                </tbody>
-                            </table>
-                        </div>
-                    '''
-                    pharmacy_html = (
-                        f"<br><b style='font-size: 12px;'>🏥 Pharmacy Locations "
-                        f"({len(pharmacies)} total):</b>{pharmacy_table_html}"
-                    )
-                else:
-                    pharmacy_html = "<br><b style='font-size: 12px;'>🏥 Pharmacy Locations:</b> <i>None found</i>"
-            else:
-                pharmacy_html = "<br><b style='font-size: 12px;'>🏥 Pharmacy Locations:</b> <i>Data not loaded</i>"
-
-            # Compact popup with enough width for location column
-            popup_height = 620
-            popup_width = 520
-            
-            # Get health statistics for this ZIP
-            health_html = format_health_stats_html(r['zip'])
-            
             popup = folium.Popup(
-                folium.IFrame(
-                    html=f"""
-                        <b>ZIP:</b> {r['zip']}<br>
-                        <b>Place:</b> {place}<br>
-                        {drive_time_html}
-                        {revenue_html}
-                        <b>Final score:</b> {r.get('final_score', float('nan')):.3f}<br>
-                        <b>Math score:</b> {r.get('score_math', float('nan')):.3f}<br>
-                        <b>AI score:</b> {r.get('ai_score', float('nan')):.3f}<br>
-                        <b>Pharmacies:</b> {int(r.get('n_pharmacies', r.get('pharmacies_count', 0)))}<br>
-                        <b>Pop density:</b> {r.get('pop_density', r.get('density', 0)):.1f}
-                        {health_html}
-                        {pharmacist_html}
-                        {pharmacy_html}
-                    """, width=popup_width, height=popup_height
-                ),
-                max_width=popup_width + 20
+                _build_compact_popup_html(r, place),
+                min_width=360,
+                max_width=560,
             )
             score_val = float(r.get("final_score", 0) or 0)
             # Keep markers comfortably clickable even in low-score/worst views.
