@@ -125,7 +125,7 @@ python data/finalfinalfinal_training.py
 **If Streamlit won't start:**
 ```bash
 # Make sure you're in the project root directory
-cd pharmacy-deserts
+cd path/to/pharmacy-deserts
 
 # Activate virtual environment if needed
 source venv/bin/activate

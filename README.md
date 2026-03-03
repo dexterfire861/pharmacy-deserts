@@ -156,6 +156,8 @@ A weighted linear combination of seven feature percentiles:
 | `IFAE_score_deficit` | 50% composite + 50% deficit rate | Alternative ranking |
 | `score_math` | Weighted sum of feature percentiles | Transparent, adjustable |
 
+> **Note on naming:** The `IFAE` prefix (originally "Isolation Forest + Autoencoder") is a legacy naming convention from an earlier model iteration. The current model uses a GLM-based pipeline, but the score column names have been preserved for backward compatibility with downstream consumers.
+
 ### Key Design Decisions
 
 | Decision | Rationale |
