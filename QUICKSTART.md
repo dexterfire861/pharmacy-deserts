@@ -1,35 +1,38 @@
 # 🏥 Pharmacy Desert Explorer - Quick Start Guide
 
-## New Structure (Simplified!)
-
-Your codebase is now organized into separate files:
+## Project Structure
 
 ```
 pharmacy-deserts/
-├── app.py                      # ← Streamlit UI (run this!)
-├── data_processing.py           # ← Data processing functions (library)
-├── IF_AE_training.ipynb        # ← AI model training (run this first)
-├── data/                       # ← Input data files
-├── results/                    # ← AI scores output
+├── app/
+│   └── app.py                  # ← Streamlit UI (run this!)
+├── data/
+│   ├── finalfinalfinal_training.py  # ← GLM model training
+│   ├── features.py             # ← Data preprocessing
+│   └── loaders.py              # ← Data loading utilities
+├── models/                     # ← Scoring logic
+├── viz/                        # ← Map visualization
+├── results/                    # ← Model output scores
+├── deploy/                     # ← Docker & deployment configs
 └── requirements.txt            # ← Dependencies
 ```
 
 ## 🚀 How to Run (2 Easy Steps!)
 
-### Step 1: Generate AI Scores (One-time setup)
+### Step 1: Generate GLM Scores (One-time setup)
 ```bash
-# Run the Isolation Forest notebook to generate AI scores
-jupyter execute IF_AE_training.ipynb
+# Run the GLM training script to generate scores
+python data/finalfinalfinal_training.py
 
-# This creates: results/national_ifae_rank.csv
+# This creates output in: results/national_ifae_rank.csv
 ```
 
 ### Step 2: Launch the Streamlit App
 ```bash
-# Run the new streamlit app
-streamlit run app.py
+# Run the Streamlit app
+streamlit run app/app.py
 
-# 🎉 That's it! The app will open in your browser
+# 🎉 That's it! The app will open in your browser at http://localhost:8501
 ```
 
 ## ⚡ What's Different Now?
@@ -42,66 +45,66 @@ streamlit run app.py
 
 ### 📁 File Purposes:
 
-**`app.py`** (Main Streamlit Application)
+**`app/app.py`** (Main Streamlit Application)
 - User interface with sliders and maps
-- Loads data using functions from `data_processing.py`
-- Blends mathematical + AI scores
-- Displays interactive visualizations
+- Loads data using cached loaders from `app/state.py`
+- Three scoring modes: GLM Only, Math Only, Blended
+- Displays interactive Folium map visualizations
 
-**`data_processing.py`** (Data Processing Library)
-- Pure functions for loading data
-- Mathematical scoring model
-- Score blending logic
-- No UI code - just data operations
+**`data/features.py`** (Data Preprocessing)
+- Percentile normalization and feature engineering
+- Score computation helpers
 
-**`IF_AE_training.ipynb`** (AI Model Training)
-- Trains Isolation Forest on features
-- Generates AI anomaly scores
-- Outputs `results/national_ifae_rank.csv`
-- Run this whenever you want fresh AI scores
+**`data/finalfinalfinal_training.py`** (GLM Model Training)
+- Poisson GLM with OOF cross-validation
+- Per-state calibration and neighbor QA
+- Outputs ranked results to `results/`
+- Run this whenever you want fresh GLM scores
 
 ## 🔄 Workflow
 
 ```
-┌─────────────────────────────┐
-│ 1. Run IF_AE_training.ipynb │
-│    (generates AI scores)    │
-└──────────┬──────────────────┘
+┌──────────────────────────────────────┐
+│ 1. python data/finalfinalfinal_      │
+│    training.py                       │
+│    (trains GLM, generates scores)    │
+└──────────┬───────────────────────────┘
            │
            v
-┌─────────────────────────────┐
-│ results/                    │
-│  └── national_ifae_rank.csv │  ← AI scores stored here
-└──────────┬──────────────────┘
+┌──────────────────────────────────────┐
+│ results/                             │
+│  └── national_ifae_rank.csv          │  ← GLM scores stored here
+│  └── qa_expected_vs_observed.csv     │  ← QA metrics
+└──────────┬───────────────────────────┘
            │
            v
-┌─────────────────────────────┐
-│ 2. Run: streamlit run app.py│
-│    (interactive dashboard)  │
-└─────────────────────────────┘
+┌──────────────────────────────────────┐
+│ 2. streamlit run app/app.py          │
+│    (interactive dashboard)           │
+└──────────────────────────────────────┘
            │
            v
    ┌───────────────────┐
-   │ App loads:        │
-   │ • Data files      │
-   │ • AI scores       │
-   │ • Blends scores   │
-   │ • Shows results   │
+   │ App loads:         │
+   │ • Data files       │
+   │ • GLM scores       │
+   │ • Blends scores    │
+   │ • Shows results    │
    └───────────────────┘
 ```
 
 ## 🎯 For Your Presentation
 
 ### Demo Flow:
-1. Show `IF_AE_training.ipynb` briefly
-   - "This trains our Isolation Forest AI model"
-   - "It analyzes income, health, pharmacy access, heat, and education"
+1. Show `data/finalfinalfinal_training.py` briefly
+   - "This trains our GLM + hybrid model"
+   - "It analyzes income, health, pharmacy access, density, and more"
    
-2. Run `app.py`
+2. Run `app/app.py`
    - "This is our interactive tool"
-   - "Left sidebar shows both models"
+   - "Left sidebar lets you choose scoring modes"
    - "Mathematical weights are adjustable"
-   - "AI scores are pre-computed"
+   - "GLM scores are pre-computed"
 
 3. Adjust sliders
    - "See how fast it responds!" ⚡
@@ -109,26 +112,26 @@ streamlit run app.py
    
 4. Show results
    - "Final ranking blends both approaches"
-   - "Math = transparent, AI = pattern discovery"
+   - "Math = transparent, GLM = statistical discovery"
 
 ## 🔧 Troubleshooting
 
-**If AI scores not found:**
+**If GLM scores not found:**
 ```bash
-# Re-run the notebook
-jupyter execute IF_AE_training.ipynb
+# Run the training script
+python data/finalfinalfinal_training.py
 ```
 
 **If Streamlit won't start:**
 ```bash
-# Make sure you're in the right directory
-cd /Users/aryaanverma/pharmacy-deserts/pharmacy-deserts
+# Make sure you're in the project root directory
+cd path/to/pharmacy-deserts
 
 # Activate virtual environment if needed
 source venv/bin/activate
 
 # Run app
-streamlit run app.py
+streamlit run app/app.py
 ```
 
 **If imports fail:**
@@ -147,9 +150,9 @@ pip install -r requirements.txt
 
 ## 💡 Pro Tips
 
-- **Update AI scores before presentation**: Run the notebook fresh
+- **Update GLM scores before presentation**: Run the training script fresh
 - **Adjust mathematical weights live**: Show stakeholder priorities
-- **Explain the hybrid approach**: Math = transparent, AI = discovery
+- **Explain the hybrid approach**: Math = transparent, GLM = discovery
 - **Use the map view**: Visual impact for presentations
 
 ---
